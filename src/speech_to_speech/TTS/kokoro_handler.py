@@ -77,6 +77,35 @@ KOKORO_LANG_DEFAULT_VOICES = {
 # Codes with a native Kokoro voice; the other map entries fall back to English.
 KOKORO_NATIVE_LANGUAGES = frozenset({"en", "ja", "zh", "fr", "es", "it", "pt", "hi"})
 
+# NOTE: benchmarking/compat patch — see openvino_dgpu_plan.md section 13.
+# The stock browser demo's Voice selector is hardcoded to Qwen3-TTS speaker
+# names (Aiden, Ryan, Dylan, Eric, Ono_Anna, Serena, Sohee, Uncle_Fu, Vivian)
+# regardless of the active TTS backend. When --tts kokoro is used, the demo
+# still sends one of those names via session.update, which is not a real
+# Kokoro voice and previously crashed TTS generation with a 404
+# RemoteEntryNotFoundError on every single turn. Validate the client-pinned
+# voice against the real Kokoro voice set and silently ignore it (falling
+# back to the configured default) when it doesn't match, instead of letting
+# the pipeline try to fetch a nonexistent voice file.
+KOKORO_VALID_VOICES = frozenset(
+    {
+        "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica", "af_kore",
+        "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
+        "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael",
+        "am_onyx", "am_puck", "am_santa",
+        "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
+        "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
+        "ef_dora", "em_alex", "em_santa",
+        "ff_siwis",
+        "hf_alpha", "hf_beta", "hm_omega", "hm_psi",
+        "if_sara", "im_nicola",
+        "jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo",
+        "pf_dora", "pm_alex", "pm_santa",
+        "zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi",
+        "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang",
+    }
+)
+
 
 class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
     """
@@ -284,6 +313,11 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
             audio_cfg = runtime_config.session.audio
             audio_output = audio_cfg.output if audio_cfg is not None else None
             voice = str(audio_output.voice) if audio_output is not None and audio_output.voice else None
+        if voice is not None and voice not in KOKORO_VALID_VOICES:
+            logger.warning(
+                "Ignoring client-requested voice %r: not a valid Kokoro voice (falling back to default)", voice
+            )
+            voice = None
         if self.backend == "mlx":
             yield from self._process_mlx(text, language_code, pinned_voice=voice, tts_input=tts_input)
         else:
