@@ -35,6 +35,7 @@ from speech_to_speech.pipeline.messages import (
     TTSInput,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+from speech_to_speech.pipeline.style import DEFAULT_STYLE, extract_style_tags, is_question, normalize_style
 from speech_to_speech.pipeline.transcript_logging import transcript_for_log
 from speech_to_speech.utils.utils import response_wants_audio
 
@@ -69,6 +70,8 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
         self._response_tts_language: str | None = None
         self._response_language_resolved = False
         self._assistant_language_probe = ""
+        self._response_style: str | None = None
+        self._voiced_style: str | None = None
 
     def _start_response(self, response_key: str | None) -> str:
         key = response_key or self._response_key or uuid4().hex
@@ -85,6 +88,28 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
         self._response_tts_language = None
         self._response_language_resolved = False
         self._assistant_language_probe = ""
+        self._response_style = None
+        self._voiced_style = None
+
+    @staticmethod
+    def _session_style(config: RuntimeConfig | None) -> str | None:
+        """Read a client-pinned spoken style off the Realtime session, if any.
+
+        ``session.update`` carries a full session object whose request type
+        accepts extra fields, so a client can pin the delivery without the
+        language model having a say::
+
+            {"type": "session.update", "session": {"style": "开心"}}
+
+        Anything unrecognised (including ``"auto"``) counts as unpinned, which
+        leaves the model's own inline tags in charge.
+        """
+        if config is None:
+            return None
+        raw = getattr(config.session, "style", None)
+        if not isinstance(raw, str):
+            return None
+        return normalize_style(raw)
 
     def _observe_assistant_language(self, text: str) -> None:
         if self._detected_assistant_language is not None:
@@ -221,6 +246,7 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
         logger.debug("LM processor: parts=%s", transcript_for_log(lm_output.parts))
 
         response_key = self._start_response(lm_output.response_key)
+        config = lm_output.runtime_config
 
         for part in lm_output.parts:
             output_sequence = self._output_sequence
@@ -239,6 +265,46 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
                             response_key=response_key,
                         )
                     )
+            if isinstance(part, AssistantTextPart):
+                # The style channel rides in the text, so split it out here:
+                # everything downstream (client transcript, history via the LLM
+                # layer, TTS) sees the clean text, and TTS additionally gets the
+                # bare style value. The style sticks for the rest of the
+                # response so only the first sentence needs a tag.
+                cleaned_text, tagged_style = extract_style_tags(part.text)
+                style_before = self._response_style
+                pinned_style = self._session_style(config)
+                if pinned_style is not None:
+                    # A client-pinned style is an explicit request, so it
+                    # outranks whatever mood the model read into the turn.
+                    self._response_style = pinned_style
+                elif tagged_style is not None:
+                    # A small model sometimes invents a tag ("抱歉", "温柔"). Passing
+                    # it through verbatim made the TTS act out the word, so anything
+                    # outside the vocabulary falls back to the neutral default.
+                    canonical = normalize_style(tagged_style)
+                    if canonical is None:
+                        logger.info("Unknown style tag %r from the model; using %s", tagged_style, DEFAULT_STYLE)
+                    self._response_style = canonical or DEFAULT_STYLE
+                voiced_style = self._response_style
+                if (
+                    pinned_style is None
+                    and tagged_style is None
+                    and voiced_style not in (None, DEFAULT_STYLE)
+                    and is_question(cleaned_text)
+                ):
+                    # The emotion came from an earlier sentence of this reply. A follow-up
+                    # question ("要不要我帮你看看？") in the same heightened voice sounds
+                    # wrong, so questions fall back to the neutral default. A tag on the
+                    # question itself, or a client-pinned style, is still honoured.
+                    voiced_style = DEFAULT_STYLE
+                self._voiced_style = voiced_style
+                logger.info(
+                    "Style: tag=%r pinned=%r inherited=%r -> using %r for %r",
+                    tagged_style, pinned_style, style_before, voiced_style, cleaned_text[:16],
+                )
+                if cleaned_text != part.text:
+                    part = AssistantTextPart(text=cleaned_text)
             event = AssistantOutputEvent(
                 history=lm_output.history,
                 parts=[part],
@@ -256,7 +322,6 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
             ):
                 continue
             logger.debug("Forwarding to TTS: %s", transcript_for_log(part.text))
-            config = lm_output.runtime_config
             if self.detect_llm_output_language or config is not None:
                 self._observe_assistant_language(part.text)
             self._tts_runtime_config = config
@@ -287,6 +352,7 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
             selected = self._response_selected_language
             yield TTSInput(
                 text=part.text,
+                style=self._voiced_style,
                 language_code=language_code,
                 selected_language=selected,
                 tts_language_code=self._response_tts_language if selected is not None else language_code,
