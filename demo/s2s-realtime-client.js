@@ -46,6 +46,7 @@
  * @property {(call: {name: string, arguments: string, callId: string}) => Promise<{output: string, image?: string}>} [executeTool]
  */
 
+import { ClientLatencyMeter } from "./client-latency.js";
 import { readTurnLatency } from "./turn-latency.js";
 import { extractResponseTranscript, trimTrailingSlash } from "./ws/codec.js";
 import { OrbVisualiser, VIS_FFT_SIZE } from "./ws/orb-visualizer.js";
@@ -54,11 +55,27 @@ import { LocalVad } from "./ws/local-vad.js";
 
 export const AUDIO_SAMPLE_RATE = 24_000;
 export const AUDIO_WORKLET_VERSION = "audio-24k-v2";
-export const DEFAULT_PLAYBACK_BUFFER_MS = 0;
+/**
+ * Audio to accumulate before playback starts.
+ *
+ * Qwen3-TTS does not trickle audio: it emits a burst every ~0.5 s (one decode
+ * chunk). Starting on the very first chunk therefore plays ~0.2 s, starves for
+ * the rest of the burst period, and repeats — audibly choppy. Gating on one
+ * burst period makes the queue never run dry, because the generator is faster
+ * than realtime (measured audio/wall 1.1-1.4) and its lead grows once started.
+ * Measured on the production stack: raw lead dips to -0.03 s, with a 500 ms gate
+ * the lead stays positive. `response.done` releases the gate early, so short
+ * replies do not pay the full buffer.
+ */
+export const DEFAULT_PLAYBACK_BUFFER_MS = 500;
 const MIC_CHUNK_MS = 40;
 const CAPTURE_CONFIG_TIMEOUT_MS = 2_000;
 const SPEAKING_OPEN_DB = -50;
 const SPEAKING_HANG_MS = 250;
+// Cap on how long the UI may wait for the worklet's "idle" after the server
+// closed a response. Only a lost worklet message can reach it; real playback of
+// a reply never runs this long.
+const AUDIO_DRAIN_FAILSAFE_MS = 120_000;
 
 /** @param {unknown} value */
 export function normalizePlaybackBufferMs(value) {
@@ -72,6 +89,17 @@ export function versionedAudioWorkletUrl(name, base) {
   const url = new URL(name, base);
   url.searchParams.set("v", AUDIO_WORKLET_VERSION);
   return url.href;
+}
+
+/**
+ * `setTimeout` whose handle never holds a Node process open. Browsers ignore
+ * this; it keeps long fail-safe timers from stalling headless test runs.
+ * @param {() => void} fn @param {number} ms
+ */
+function deferred(fn, ms) {
+  const handle = setTimeout(fn, ms);
+  if (handle && typeof handle === "object" && typeof handle.unref === "function") handle.unref();
+  return handle;
 }
 
 /** @param {string} message @param {string} code @param {object} [extra] */
@@ -106,6 +134,8 @@ export class S2sRealtimeClient extends EventTarget {
     this._closed = false;
     this._closing = false;
     this._muted = false;
+    this._style = "";
+    this._interruptible = true;
     this._session = null;
     this._transport = null;
     this._agent = null;
@@ -127,6 +157,12 @@ export class S2sRealtimeClient extends EventTarget {
     this._playbackItems = new Map();
     this._playbackInterruptions = new Map();
     this._playbackClearId = 0;
+    // "Reply finished being heard" signal. `response.done` only means the server
+    // stopped generating; the buffered tail can still be playing. We track the
+    // worklet's idle edge and remember which response is waiting on it.
+    this._playbackIdle = true;
+    this._drainResponseId = "";
+    this._drainTimer = 0;
     this._micAnalyser = null;
     this._outAnalyser = null;
     this._remoteSrc = null;
@@ -147,6 +183,7 @@ export class S2sRealtimeClient extends EventTarget {
     this._userSnapshotByItem = new Map();
     this._currentUserItemId = "";
     this._userAudioRecorder = new SentAudioRecorder({ sampleRate: AUDIO_SAMPLE_RATE });
+    this._clientLatency = new ClientLatencyMeter();
     this._debug = (() => {
       try { return localStorage.getItem("s2s.debug") === "1"; } catch { return false; }
     })();
@@ -243,15 +280,40 @@ export class S2sRealtimeClient extends EventTarget {
       if (this.options.transport === "websocket") this._interruptPlayback();
       else this._clearPlayback();
     });
+    // The Agents SDK's RealtimeSession is an EventEmitter and can emit its own
+    // top-level "error" independently of our transport/protocol handling above
+    // (e.g. a WebSocket-level failure or an internal SDK exception). Without a
+    // listener here, some EventEmitter implementations throw on an unhandled
+    // "error" event, and whatever is passed isn't guaranteed to be an Error
+    // instance (it can be a raw Event/ErrorEvent), which previously surfaced
+    // to the user as the literal string "[object Event]" via
+    // `String(err)` in main.js's onFatalError. Normalize it into a real Error
+    // with a readable message and treat it as non-fatal (matches the
+    // protocol-level "error" case above): log it and keep the session alive
+    // rather than tearing down the call on what may be a transient condition.
+    this._session.on("error", (err) => {
+      let message = "Realtime session error";
+      if (err instanceof Error) {
+        message = err.message;
+      } else if (err && typeof err === "object") {
+        if (err.error instanceof Error) message = err.error.message;
+        else if (typeof (/** @type {any} */ (err).error?.message) === "string") message = /** @type {any} */ (err).error.message;
+        else if (typeof (/** @type {any} */ (err).message) === "string") message = /** @type {any} */ (err).message;
+      }
+      console.warn("[s2s-client] session error:", err);
+      this.dispatchEvent(new CustomEvent("server-error", { detail: { error: new Error(message) } }));
+    });
 
     await this._session.connect({ apiKey: "s2s-local", url });
     if (this.options.transport === "webrtc") this._attachRtcOutput();
+    this._applyInterruptible();
     const greeting = this.options.startupGreeting?.trim();
     if (greeting) {
       this._responseRequested = true;
       this._session.sendMessage(greeting);
     }
     this.setMuted(this._muted);
+    this._applyStylePin();
     this._setStatus("connected");
     // Model loading never delays connecting, greeting, or microphone streaming.
     if (this.options.localVad !== false && this._ctx) {
@@ -461,6 +523,7 @@ export class S2sRealtimeClient extends EventTarget {
     const key = this._playbackAudioKey;
     const item = this._playbackItems.get(key);
     if (item) item.samples += samples.length;
+    this._clientLatency.noteAudioChunk(event.responseId, samples.length);
     this._enqueuePlayback(samples, key);
   }
 
@@ -480,7 +543,9 @@ export class S2sRealtimeClient extends EventTarget {
     this._pendingPlaybackSamples = 0;
     this._playbackStarted = true;
     this._audibleResponses.add(this._playbackResponseId);
+    this._clientLatency.notePlaybackStart(this._playbackResponseId);
     this._aiSpeaking = true;
+    this._playbackIdle = false;
     this._markAudible();
   }
 
@@ -519,8 +584,40 @@ export class S2sRealtimeClient extends EventTarget {
     this._aiSpeaking = false;
   }
 
+  /**
+   * Hold the "reply finished speaking" signal until the worklet reports it has
+   * gone idle. Emits `response-audio-finished` exactly once per armed response.
+   * The fail-safe covers a lost worklet message so the UI can never wait forever.
+   * @param {string} responseId
+   */
+  _awaitAudioDrain(responseId) {
+    if (this._drainTimer) clearTimeout(this._drainTimer);
+    this._drainResponseId = responseId;
+    this._drainTimer = deferred(() => this._onPlaybackIdle(), AUDIO_DRAIN_FAILSAFE_MS);
+    // The tail may already have finished before the server closed the response.
+    if (this._playbackIdle) queueMicrotask(() => this._onPlaybackIdle());
+  }
+
+  /** The worklet has drained — nothing is audible now. Release any waiter. */
+  _onPlaybackIdle() {
+    this._playbackIdle = true;
+    const responseId = this._drainResponseId;
+    if (!responseId) return;
+    this._drainResponseId = "";
+    if (this._drainTimer) {
+      clearTimeout(this._drainTimer);
+      this._drainTimer = 0;
+    }
+    this.dispatchEvent(new CustomEvent("response-audio-finished", { detail: { responseId } }));
+  }
+
   _onPlaybackMessage(message) {
-    if (message?.kind !== "cleared") return;
+    const kind = message?.kind;
+    if (kind === "idle") {
+      this._onPlaybackIdle();
+      return;
+    }
+    if (kind !== "cleared") return;
     const items = this._playbackInterruptions.get(message.clearId);
     this._playbackInterruptions.delete(message.clearId);
     if (!items || this._closed || this._status === "error") return;
@@ -605,6 +702,7 @@ export class S2sRealtimeClient extends EventTarget {
       case "response.created":
         this._responseRequested = false;
         this._activeResponseId = event.response?.id ?? "";
+        this._clientLatency.begin(this._activeResponseId);
         if (this.options.transport === "websocket") this._resetPlaybackBuffer(this._activeResponseId);
         if (this._status === "connected" || this._status === "user-speaking") this._setStatus("processing");
         break;
@@ -687,6 +785,7 @@ export class S2sRealtimeClient extends EventTarget {
         const responseId = typeof event.response_id === "string" ? event.response_id : "";
         const delta = typeof event.delta === "string" ? event.delta : "";
         if (delta) {
+          this._clientLatency.noteText(responseId, delta);
           this._asstTranscriptByResp.set(responseId, (this._asstTranscriptByResp.get(responseId) || "") + delta);
           this.dispatchEvent(new CustomEvent("transcript", { detail: {
             role: "assistant", text: this._asstDisplay(responseId), partial: true, responseId,
@@ -713,6 +812,11 @@ export class S2sRealtimeClient extends EventTarget {
         if (this.options.transport === "websocket") {
           this._finishPlayback(responseId, event.response?.status ?? "completed");
         }
+        // The server is done generating, but the buffered audio may still be
+        // playing. Arm the drain signal so listeners can release UI that is
+        // waiting for the reply to be heard out in full.
+        const audible = this._audibleResponses.has(responseId);
+        if (audible) this._awaitAudioDrain(responseId);
         this._responseRequested = false;
         this._activeResponseId = "";
         this._aiSpeaking = false;
@@ -721,8 +825,9 @@ export class S2sRealtimeClient extends EventTarget {
         this.dispatchEvent(new CustomEvent("response-finished", { detail: {
           responseId,
           status: event.response?.status ?? "completed",
-          audible: this._audibleResponses.has(responseId),
+          audible,
           latency: readTurnLatency(event.response),
+          clientTiming: this._clientLatency.summary(responseId),
           transcript,
         } }));
         this._audibleResponses.delete(responseId);
@@ -757,6 +862,48 @@ export class S2sRealtimeClient extends EventTarget {
     if (!this._session) return;
     this._agent = this._buildAgent();
     void this._session.updateAgent(this._agent);
+  }
+
+  /**
+   * Pin the spoken delivery style, or "" to let the model decide.
+   *
+   * Sent as an extra field on the Realtime session: the server's session
+   * request type allows extras, so this needs no protocol change, and the LM
+   * output processor prefers a pinned style over the model's own mood reading.
+   * @param {string} style canonical style from the pipeline vocabulary
+   */
+  setStyle(style) {
+    this._style = style || "";
+    this._applyStylePin();
+  }
+
+  /**
+   * Whether user speech may cancel the reply being generated. Slow engines
+   * (CosyVoice on CPU: 8-20 s before first audio) must turn this off: any
+   * VAD trigger in that wait (breath, room noise, the user talking on) would
+   * otherwise cancel the in-flight synthesis and the reply never plays.
+   * @param {boolean} on
+   */
+  setInterruptible(on) {
+    this._interruptible = !!on;
+    this._applyInterruptible();
+  }
+
+  _applyInterruptible() {
+    this._transport?.sendEvent?.({
+      type: "session.update",
+      session: {
+        type: "realtime",
+        audio: { input: { turn_detection: { type: "server_vad", interrupt_response: this._interruptible } } },
+      },
+    });
+  }
+
+  _applyStylePin() {
+    this._transport?.sendEvent?.({
+      type: "session.update",
+      session: { type: "realtime", style: this._style || "" },
+    });
   }
 
   /** @param {ToolDef[]} tools */
