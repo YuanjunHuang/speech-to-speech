@@ -54,7 +54,7 @@ import { SentAudioRecorder } from "./ws/user-audio-recorder.js";
 import { LocalVad } from "./ws/local-vad.js";
 
 export const AUDIO_SAMPLE_RATE = 24_000;
-export const AUDIO_WORKLET_VERSION = "audio-24k-v2";
+export const AUDIO_WORKLET_VERSION = "audio-24k-v5";
 /**
  * Audio to accumulate before playback starts.
  *
