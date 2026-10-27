@@ -98,18 +98,50 @@ def _has_unclosed_markdown_fence(text: str) -> bool:
     return opening_ticks is not None
 
 
+# CJK scripts (Han ideographs + kana). Used to decide when to bypass the NLTK
+# tokenizer, whose Punkt model only understands Latin ``.?!`` and returns a whole
+# Chinese/Japanese paragraph as a single sentence.
+_CJK_CHAR_PATTERN = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+# Sentence boundary used for CJK text. Splits after a run of sentence-final
+# punctuation (keeping any trailing closing quotes/brackets with the sentence)
+# and treats newlines as boundaries. Unlike NLTK this needs no training data and
+# never treats ``。``/``！``/``？`` as an intra-sentence character.
+_CJK_SENTENCE_SPLIT_PATTERN = re.compile(
+    r"[^。！？!?；;…．｡\n]*[。！？!?；;…．｡]+[”’\"'」』】）》〉)）]*"
+    r"|[^。！？!?；;…．｡\n]+"
+)
+
+
+def _cjk_sent_tokenize(text: str) -> list[str]:
+    """Sentence-split CJK prose on ideographic terminators and newlines."""
+    return [sentence.strip() for sentence in _CJK_SENTENCE_SPLIT_PATTERN.findall(text) if sentence.strip()]
+
+
 def sent_tokenize_preserving_markdown_code(
     text: str,
     tokenizer: Callable[[str], list[str]],
 ) -> list[str]:
-    """Tokenize prose without splitting complete Markdown constructs."""
+    """Tokenize prose without splitting complete Markdown constructs.
+
+    CJK text bypasses ``tokenizer`` (normally NLTK's English Punkt model), which
+    cannot segment on ``。！？`` and would otherwise keep an entire Chinese reply
+    as one sentence. That in turn starves downstream sentence batching, so the
+    whole reply is synthesized at once and speech only starts after the full
+    response is generated.
+    """
     if _has_unclosed_markdown_fence(text):
         return [text]
     protected_text, protected_code = _protect_markdown_code(text, keep_delimiters=True)
     protected_text, protected_emphasis = _protect_matched_emphasis(protected_text)
+    sentences = (
+        _cjk_sent_tokenize(protected_text)
+        if _CJK_CHAR_PATTERN.search(protected_text)
+        else tokenizer(protected_text)
+    )
     return [
         _restore_markdown_code(_restore_matched_emphasis(sentence, protected_emphasis), protected_code)
-        for sentence in tokenizer(protected_text)
+        for sentence in sentences
     ]
 
 

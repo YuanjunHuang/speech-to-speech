@@ -245,3 +245,42 @@ def test_remove_markdown_is_streaming_safe_across_split_deltas() -> None:
 
 def test_sentence_tokenization_preserves_complete_emphasis_pairs() -> None:
     assert sent_tokenize_preserving_markdown_code("**Let me check.**", sent_tokenize) == ["**Let me check.**"]
+
+
+def test_sentence_tokenization_splits_chinese_on_ideographic_terminators() -> None:
+    # NLTK's Punkt model returns this whole paragraph as one sentence, which
+    # starves sentence batching so the entire reply is synthesized at once.
+    text = "杭州是一座历史悠久的城市。这里四季分明！春天鲜花盛开？就是这样。"
+    assert sent_tokenize_preserving_markdown_code(text, sent_tokenize) == [
+        "杭州是一座历史悠久的城市。",
+        "这里四季分明！",
+        "春天鲜花盛开？",
+        "就是这样。",
+    ]
+
+
+def test_sentence_tokenization_splits_chinese_on_newlines() -> None:
+    assert sent_tokenize_preserving_markdown_code("第一句\n第二句", sent_tokenize) == ["第一句", "第二句"]
+
+
+def test_sentence_tokenization_keeps_trailing_closing_quote_with_chinese_sentence() -> None:
+    assert sent_tokenize_preserving_markdown_code("他说：“好的。”然后离开了。", sent_tokenize) == [
+        "他说：“好的。”",
+        "然后离开了。",
+    ]
+
+
+def test_sentence_tokenization_keeps_english_on_the_injected_tokenizer() -> None:
+    # Latin text must still go through NLTK so abbreviations stay intact.
+    assert sent_tokenize_preserving_markdown_code("Mr. Smith went home. He slept.", sent_tokenize) == [
+        "Mr. Smith went home.",
+        "He slept.",
+    ]
+
+
+def test_sentence_tokenization_does_not_split_chinese_on_latin_period() -> None:
+    # A Latin period inside CJK prose (e.g. a version number) is not a boundary.
+    assert sent_tokenize_preserving_markdown_code("已升级到 v1.0 版本。很好。", sent_tokenize) == [
+        "已升级到 v1.0 版本。",
+        "很好。",
+    ]
