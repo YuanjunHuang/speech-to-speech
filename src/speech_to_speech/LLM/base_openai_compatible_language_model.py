@@ -57,6 +57,7 @@ from speech_to_speech.pipeline.messages import (
     TokenUsage,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+from speech_to_speech.pipeline.style import strip_style_tags
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
 from speech_to_speech.utils.utils import audio_to_wav_base64, is_out_of_band, response_wants_audio
 
@@ -83,6 +84,20 @@ class TextDelta(BaseModel):
     text: str
 
 
+def _history_content(part: AssistantContent) -> AssistantContent:
+    """Drop spoken-style tags from an assistant content part bound for history.
+
+    Style tags steer the TTS voice; they are pipeline protocol rather than
+    something the assistant said, so history keeps only the voiced text.
+    """
+    updates = {
+        name: strip_style_tags(value)
+        for name in ("text", "transcript")
+        if isinstance(value := getattr(part, name, None), str)
+    }
+    return part.model_copy(update=updates) if updates else part
+
+
 class AssistantMessage(BaseModel):
     """A complete assistant turn to write back to history."""
 
@@ -92,7 +107,10 @@ class AssistantMessage(BaseModel):
 
     def to_chat_item(self) -> RealtimeConversationItemAssistantMessage:
         item = RealtimeConversationItemAssistantMessage(
-            type="message", role="assistant", content=self.content, id=self.id
+            type="message",
+            role="assistant",
+            content=[_history_content(part) for part in self.content],
+            id=self.id,
         )
         if self.response_item is not None:
             return ResponsesAssistantMessage(
@@ -196,6 +214,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         request_timeout_s: float = 20.0,
         stream_batch_sentences: int = 3,
         enable_lang_prompt: bool = False,
+        enable_style_tags: bool = False,
         compact_history: bool = False,
         audio_max_tokens: int = 256,
         audio_temperature: float = 0.0,
@@ -209,6 +228,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self.stream = stream
         self.stream_batch_sentences = max(1, stream_batch_sentences)
         self.enable_lang_prompt = enable_lang_prompt
+        self.enable_style_tags = enable_style_tags
         self.gen_kwargs = dict(gen_kwargs)
         self.audio_max_tokens = audio_max_tokens
         self.audio_temperature = audio_temperature
@@ -522,7 +542,11 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if not instructions and not language_name:
             return
         builder = build_voice_system_prompt if wants_audio else build_text_system_prompt
-        full_instructions = builder(instructions or "", language_name=language_name)
+        # Only the voice builder knows about spoken styles.
+        style_kwargs = (
+            {"enable_style_tags": getattr(self, "enable_style_tags", False)} if wants_audio else {}
+        )
+        full_instructions = builder(instructions or "", language_name=language_name, **style_kwargs)
         chat.prepend_instructions(full_instructions)
 
     # ── output helpers ──────────────────────────────────────────────────────--

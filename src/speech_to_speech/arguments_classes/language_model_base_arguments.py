@@ -37,6 +37,14 @@ class LanguageModelBaseArguments:
             "(e.g. 'Please reply to my message in French.'). Default is False."
         },
     )
+    enable_style_tags: bool = field(
+        default=False,
+        metadata={
+            "help": "When True, teach the model the inline [style:...] tag that steers TTS delivery "
+            "(e.g. happy, sad, angry, calm, whisper). Only meaningful with a TTS backend that honours "
+            "styles, such as Qwen3-TTS custom voice. Default is False."
+        },
+    )
     compact_history: bool = field(
         default=True,
         metadata={

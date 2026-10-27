@@ -23,12 +23,30 @@ def test_coalesce_pending_tts_input_merges_ready_sentences_and_stops_before_resp
     handler.queue_in.put(TTSInput(text="Third sentence.", language_code="en"))
     handler.queue_in.put(EndOfResponse())
 
-    text, lang = handler._coalesce_pending_tts_input(TTSInput(text="First sentence.", language_code="en"))
+    text, lang, style = handler._coalesce_pending_tts_input(TTSInput(text="First sentence.", language_code="en"))
 
     assert text == "First sentence. Second sentence. Third sentence."
     assert lang == "en"
+    assert style is None
     remaining = handler.queue_in.get_nowait()
     assert isinstance(remaining, EndOfResponse)
+
+
+def test_coalesce_pending_tts_input_keeps_the_first_style_in_order():
+    handler = _make_handler()
+
+    handler.queue_in.put(TTSInput(text="Second sentence.", language_code="en", style="开心"))
+
+    # The current input wins when it carries a style of its own.
+    _, _, style = handler._coalesce_pending_tts_input(
+        TTSInput(text="First sentence.", language_code="en", style="难过")
+    )
+    assert style == "难过"
+
+    # Otherwise the first styled chunk absorbed from the queue supplies it.
+    handler.queue_in.put(TTSInput(text="Fourth sentence.", language_code="en", style="耳语"))
+    _, _, style = handler._coalesce_pending_tts_input(TTSInput(text="Third sentence.", language_code="en"))
+    assert style == "耳语"
 
 
 def test_coalesce_pending_processor_output_for_one_response():
@@ -49,7 +67,7 @@ def test_coalesce_pending_processor_output_for_one_response():
     handler.queue_in.put(outputs[2])
     handler.queue_in.put(outputs[3])
 
-    text, _ = handler._coalesce_pending_tts_input(outputs[1])
+    text, _, _ = handler._coalesce_pending_tts_input(outputs[1])
 
     assert text == "First sentence. Second sentence."
     assert handler.queue_out.get_nowait() == outputs[2]
@@ -60,10 +78,11 @@ def test_coalesce_pending_tts_input_stops_before_control_messages():
     handler = _make_handler()
 
     handler.queue_in.put(SESSION_END)
-    text, lang = handler._coalesce_pending_tts_input(TTSInput(text="Hello.", language_code="en"))
+    text, lang, style = handler._coalesce_pending_tts_input(TTSInput(text="Hello.", language_code="en"))
 
     assert text == "Hello."
     assert lang == "en"
+    assert style is None
     assert handler.queue_in.get_nowait() == SESSION_END
 
 
@@ -74,7 +93,7 @@ def test_coalesce_pending_tts_input_stops_at_ordered_output_boundary():
     )
     handler.queue_in.put(TTSInput(text="After tool."))
 
-    text, _ = handler._coalesce_pending_tts_input(TTSInput(text="Before tool."))
+    text, _, _ = handler._coalesce_pending_tts_input(TTSInput(text="Before tool."))
 
     assert text == "Before tool."
     assert isinstance(handler.queue_in.get_nowait(), AssistantOutputEvent)
