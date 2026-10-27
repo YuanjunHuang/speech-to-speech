@@ -107,7 +107,10 @@ class AssistantMessage(BaseModel):
 
     def to_chat_item(self) -> RealtimeConversationItemAssistantMessage:
         item = RealtimeConversationItemAssistantMessage(
-            type="message", role="assistant", content=self.content, id=self.id
+            type="message",
+            role="assistant",
+            content=[_history_content(part) for part in self.content],
+            id=self.id,
         )
         if self.response_item is not None:
             return ResponsesAssistantMessage(
@@ -210,6 +213,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         reasoning_effort: Optional[str] = None,
         request_timeout_s: float = 20.0,
         stream_batch_sentences: int = 3,
+        stream_batch_schedule: str = "",
+        stream_batch_first_min_chars: int = 0,
         enable_lang_prompt: bool = False,
         enable_style_tags: bool = False,
         compact_history: bool = False,
@@ -224,6 +229,11 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self.model_name = model_name
         self.stream = stream
         self.stream_batch_sentences = max(1, stream_batch_sentences)
+        # Sentence counts for the first batches of each response (see the argument help).
+        self.stream_batch_first_min_chars = max(0, int(stream_batch_first_min_chars or 0))
+        self.stream_batch_schedule = [
+            max(1, int(part)) for part in str(stream_batch_schedule or "").replace(" ", "").split(",") if part.isdigit()
+        ]
         self.enable_lang_prompt = enable_lang_prompt
         self.enable_style_tags = enable_style_tags
         self.gen_kwargs = dict(gen_kwargs)
@@ -620,6 +630,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         cancelled = False
         printable_text = ""
         sentence_batch: list[str] = []
+        batches_flushed = 0
+
+        def _batch_target() -> int:
+            if batches_flushed < len(self.stream_batch_schedule):
+                return self.stream_batch_schedule[batches_flushed]
+            return self.stream_batch_sentences
 
         def _flush(batch: list[str]) -> Iterator[LLMOut]:
             if not batch:
@@ -687,13 +703,18 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 if len(sentences) > 1:
                     for s in sentences[:-1]:
                         sentence_batch.append(remove_markdown(s))
-                        if len(sentence_batch) >= self.stream_batch_sentences:
+                        first_ok = (
+                            batches_flushed > 0
+                            or sum(len(x) for x in sentence_batch) >= self.stream_batch_first_min_chars
+                        )
+                        if len(sentence_batch) >= _batch_target() and first_ok:
                             if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
                                 logger.info("LLM generation cancelled (stale speculative turn)")
                                 cancelled = True
                                 break
                             yield from _flush(sentence_batch)
                             sentence_batch = []
+                            batches_flushed += 1
                     if cancelled:
                         break
                     printable_text = sentences[-1] + trailing_whitespace
