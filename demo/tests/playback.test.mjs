@@ -215,6 +215,8 @@ test("disconnect discards pending audio even before the UI closes the client", a
   class Transport {
     listeners = new Map();
     on(name, callback) { this.listeners.set(name, callback); }
+    // connect() pins the style via session.update, so the fake needs this hook.
+    sendEvent() {}
   }
   class Session {
     on() {}
@@ -245,7 +247,7 @@ test("disconnect discards pending audio even before the UI closes the client", a
 test("SDK interruption signal drops pending audio", async () => {
   const listeners = new Map();
   globalThis.OpenAIAgentsRealtime = {
-    OpenAIRealtimeWebSocket: class { on() {} },
+    OpenAIRealtimeWebSocket: class { on() {} sendEvent() {} },
     RealtimeSession: class {
       on(name, callback) { listeners.set(name, callback); }
       async connect() {}
@@ -287,8 +289,12 @@ test("settings persist the reserve, normalize invalid values, and hide it for We
   vm.runInContext(`${prefix}\n${functions}\nglobalThis.api = {loadSettings, saveSettings, readSettingsFromForm, syncTransportUi};`, context);
   const { api } = context;
   assert.equal(api.loadSettings().playbackBufferMs, DEFAULT_PLAYBACK_BUFFER_MS);
+  // The pre-Qwen3 key may still hold 0 (the old default). It must be ignored so
+  // existing browsers pick up the new, non-choppy default.
+  stored.set("s2s.ws.playbackBufferMs", "0");
+  assert.equal(api.loadSettings().playbackBufferMs, DEFAULT_PLAYBACK_BUFFER_MS);
   for (const raw of ["", "bad", "NaN", "Infinity", "-1", "   "]) {
-    stored.set("s2s.ws.playbackBufferMs", raw);
+    stored.set("s2s.ws.playbackBufferMs.v2", raw);
     assert.equal(api.loadSettings().playbackBufferMs, DEFAULT_PLAYBACK_BUFFER_MS);
   }
   for (const raw of [undefined, null, NaN, Infinity, -1, {}, true]) {
@@ -300,7 +306,7 @@ test("settings persist the reserve, normalize invalid values, and hide it for We
     context.inputPlaybackBuffer.value = String(ms);
     api.saveSettings(api.readSettingsFromForm());
     assert.equal(api.loadSettings().playbackBufferMs, ms);
-    assert.equal(stored.get("s2s.ws.playbackBufferMs"), String(ms));
+    assert.equal(stored.get("s2s.ws.playbackBufferMs.v2"), String(ms));
   }
   context.settings = { ...api.loadSettings(), transport: "webrtc", playbackBufferMs: 1200 };
   api.syncTransportUi();
@@ -334,3 +340,72 @@ for (const status of ["cancelled", "failed"]) {
     assert.equal(f.released().length, 2400);
   });
 }
+
+test("worklet announces idle exactly once after its queue drains", () => {
+  const output = worklet();
+  const idles = () => output.reports.filter((m) => m.kind === "idle").length;
+  output.send({ kind: "audio", samples: new Float32Array(2400).fill(0.25) });
+  assert.equal(idles(), 0, "silent until playback actually starts");
+  output.render(4800); // consume the whole chunk (24 kHz -> 48 kHz)
+  assert.equal(idles(), 0, "the ramp-out is still audible");
+  output.render(400);
+  assert.equal(idles(), 1);
+  output.render(200); // continued silence must not re-announce
+  assert.equal(idles(), 1);
+});
+
+test("reply audio-drain waits for playback, then reports once", () => {
+  const f = fixture();
+  const finished = [];
+  f.client.addEventListener("response-audio-finished", (e) => finished.push(e.detail.responseId));
+  f.start("a");
+  f.audio("a", 2400); // released to the worklet
+  f.done("a"); // server closed, but the buffered tail is still playing
+  assert.deepEqual(finished, [], "must not report before the audio is heard");
+  f.client._onPlaybackMessage({ kind: "idle" });
+  assert.deepEqual(finished, ["a"]);
+  f.client._onPlaybackMessage({ kind: "idle" });
+  assert.deepEqual(finished, ["a"], "reported exactly once");
+});
+
+test("audio that drained before the close reports on the next tick", async () => {
+  const f = fixture();
+  const finished = [];
+  f.client.addEventListener("response-audio-finished", (e) => finished.push(e.detail.responseId));
+  f.start("a");
+  f.audio("a", 2400);
+  f.client._onPlaybackMessage({ kind: "idle" }); // tail played out before response.done
+  f.done("a");
+  assert.deepEqual(finished, [], "deferred so response-finished still arrives first");
+  await Promise.resolve();
+  assert.deepEqual(finished, ["a"]);
+});
+
+test("a reply that produced no audio never arms the drain wait", () => {
+  const f = fixture();
+  const finished = [];
+  const closed = [];
+  f.client.addEventListener("response-audio-finished", (e) => finished.push(e.detail.responseId));
+  f.client.addEventListener("response-finished", (e) => closed.push(e.detail));
+  f.start("a");
+  f.done("a");
+  assert.equal(closed.length, 1);
+  assert.equal(closed[0].audible, false);
+  assert.deepEqual(finished, []);
+});
+
+test("each response reports its own drain", () => {
+  const f = fixture();
+  const finished = [];
+  f.client.addEventListener("response-audio-finished", (e) => finished.push(e.detail.responseId));
+  f.start("a");
+  f.audio("a", 2400);
+  f.done("a");
+  f.start("b");
+  f.audio("b", 2400);
+  f.done("b");
+  f.client._onPlaybackMessage({ kind: "idle" });
+  assert.deepEqual(finished, ["b"], "only the most recent waiter");
+  f.client._onPlaybackMessage({ kind: "idle" });
+  assert.deepEqual(finished, ["b"], "a single idle edge releases one waiter");
+});
