@@ -462,6 +462,7 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
         language: str | None = None,
         task_type: str | None = None,
         instructions: str | None = None,
+        style_instructions: bool = False,
         response_format: str = "pcm",
         sample_rate: int = 24000,
         speed: float = 1.0,
@@ -493,6 +494,10 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.language = language
         self.task_type = task_type
         self.instructions = instructions
+        # When enabled, the per-utterance style tag (开心/难过/…) is forwarded as
+        # `instructions`, overriding the fixed value above. Servers such as
+        # CosyVoice's instruct2 use it to change delivery.
+        self.style_instructions = style_instructions
         self.response_format = response_format
         self.sample_rate = sample_rate
         self.speed = speed
@@ -612,7 +617,7 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 and self.language.strip().lower() == "auto"
             )
             if selected is None and not use_detected_language:
-                operation = self._make_operation(text=text, voice=voice)
+                operation = self._make_operation(text=text, voice=voice, style=tts_input.style)
             else:
                 language = (
                     tts_input.response_assistant_language_code if use_detected_language else tts_input.tts_language_code
@@ -641,6 +646,7 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
                     voice=voice,
                     language=language,
                     use_setup_language=False,
+                    style=tts_input.style,
                 )
             with self._operation_lock:
                 self._active_operation = operation
@@ -711,6 +717,7 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
         voice: str | dict[str, str],
         language: str | None = None,
         use_setup_language: bool = True,
+        style: str | None = None,
     ) -> HttpSpeechOperation:
         return HttpSpeechOperation(
             endpoint_url=self.endpoint_url,
@@ -720,6 +727,7 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
                 voice=voice,
                 language=language,
                 use_setup_language=use_setup_language,
+                style=style,
             ),
             timeout_s=self.timeout,
             response_format=self.response_format,
@@ -732,6 +740,7 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
         voice: str | dict[str, str],
         language: str | None = None,
         use_setup_language: bool = True,
+        style: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -754,7 +763,10 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
             payload.pop("language", None)
         if self.task_type:
             payload["task_type"] = self.task_type
-        if self.instructions:
+        if style and self.style_instructions:
+            # The utterance style wins over the configured fixed instructions.
+            payload["instructions"] = style
+        elif self.instructions:
             payload["instructions"] = self.instructions
         return payload
 
