@@ -16,6 +16,10 @@
  *     { kind: "stats", queuedMs, played }               every ~250 ms
  *     { kind: "underrun" }                              every time the queue
  *                                                      runs dry mid-playback
+ *     { kind: "idle" }                                  when playback stops, i.e.
+ *                                                      the last sample has been
+ *                                                      rendered (queued audio
+ *                                                      fully drained or cleared)
  *
  * Underrun strategy: output silence. We do NOT hold the last sample (that
  * tends to produce audible clicks/buzzes when long gaps appear between
@@ -78,6 +82,18 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
     };
   }
 
+  /**
+   * Stop playing and tell the main thread. This fires exactly once per playback
+   * run, whether the queue drained naturally or was cleared mid-stream, so it is
+   * the reliable "nothing is audible now" edge.
+   */
+  _goIdle() {
+    if (!this._playing) return;
+    this._playing = false;
+    this._lastSample = 0;
+    this.port.postMessage({ kind: "idle" });
+  }
+
   _queuedSamples() {
     let total = -this._readIdx;
     for (const buf of this._queue) total += buf.samples.length;
@@ -138,8 +154,7 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
           sample = this._lastSample * Math.max(0, 1 - 1 / FADE_FRAMES);
           this._lastSample = sample;
           if (Math.abs(sample) < 1e-4) {
-            this._playing = false;
-            this._lastSample = 0;
+            this._goIdle();
             this.port.postMessage({ kind: "underrun" });
           }
         } else {
@@ -158,8 +173,7 @@ class AudioPlaybackProcessor extends AudioWorkletProcessor {
           sample *= gain;
           this._fadeOut -= 1;
           if (this._fadeOut === 0) {
-            this._playing = false;
-            this._lastSample = 0;
+            this._goIdle();
           }
         }
 

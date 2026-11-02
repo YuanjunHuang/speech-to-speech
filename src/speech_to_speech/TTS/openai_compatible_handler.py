@@ -4,7 +4,7 @@ import asyncio
 import io
 import logging
 import os
-import wave
+import struct
 from collections.abc import Callable
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
@@ -50,6 +50,70 @@ _AUDIO_MEDIA_TYPES_BY_FORMAT = {
     "aac": frozenset({"audio/aac"}),
     "flac": frozenset({"audio/flac", "audio/x-flac"}),
 }
+
+# RIFF/WAVE "fmt " chunk audio format tags (standard values from the RIFF spec).
+_WAVE_FORMAT_PCM = 1
+_WAVE_FORMAT_IEEE_FLOAT = 3
+_WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+
+
+def _read_exact(stream: "_StreamingByteReader", n: int) -> bytes:
+    """Read exactly ``n`` bytes (or fewer at end of stream)."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _parse_wav_header(stream: "_StreamingByteReader") -> tuple[int, int, int, int]:
+    """Parse a streaming RIFF/WAVE container up to (not including) the audio
+    data, returning (audio_format, channels, sample_rate, bits_per_sample).
+
+    Deliberately independent of the stdlib ``wave`` module, which only
+    understands integer PCM (format tag 1) and rejects IEEE-float WAV
+    (format tag 3) outright — several GenAI speech servers emit the latter.
+    """
+    riff = _read_exact(stream, 12)
+    if len(riff) < 12 or riff[0:4] != b"RIFF" or riff[8:12] != b"WAVE":
+        raise SpeechRequestError("speech endpoint returned an invalid WAV stream")
+
+    audio_format: int | None = None
+    channels: int | None = None
+    sample_rate: int | None = None
+    bits_per_sample: int | None = None
+    while True:
+        header = _read_exact(stream, 8)
+        if len(header) < 8:
+            raise SpeechRequestError("speech endpoint returned an invalid WAV stream (missing data chunk)")
+        chunk_id = header[0:4]
+        chunk_size = struct.unpack("<I", header[4:8])[0]
+        if chunk_id == b"fmt ":
+            fmt = _read_exact(stream, chunk_size)
+            if len(fmt) < 16:
+                raise SpeechRequestError("speech endpoint returned an invalid WAV stream (short fmt chunk)")
+            audio_format, channels, sample_rate = struct.unpack("<HHI", fmt[0:8])
+            bits_per_sample = struct.unpack("<H", fmt[14:16])[0]
+            if audio_format == _WAVE_FORMAT_EXTENSIBLE and len(fmt) >= 40:
+                # WAVEFORMATEXTENSIBLE: the real tag lives in the first two
+                # bytes of the sub-format GUID, 10 bytes into the extension.
+                audio_format = struct.unpack("<H", fmt[24:26])[0]
+            if chunk_size % 2:
+                stream.read(1)  # RIFF chunks are padded to an even size
+        elif chunk_id == b"data":
+            if audio_format is None or channels is None or sample_rate is None or bits_per_sample is None:
+                raise SpeechRequestError("speech endpoint returned an invalid WAV stream (data before fmt)")
+            return audio_format, channels, sample_rate, bits_per_sample
+        else:
+            # Skip chunks we don't care about (LIST, fact, etc.).
+            remaining = chunk_size + (chunk_size % 2)
+            while remaining > 0:
+                skipped = stream.read(min(remaining, 65536))
+                if not skipped:
+                    raise SpeechRequestError("speech endpoint returned an invalid WAV stream (truncated)")
+                remaining -= len(skipped)
 
 
 class HttpSpeechOperation:
@@ -164,10 +228,26 @@ class HttpSpeechOperation:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as exc:
                     raise SpeechRequestError(f"speech server returned HTTP {exc.response.status_code}") from exc
-                self._validate_content_type(response)
+                # NOTE: benchmarking/compat patch — see openvino_dgpu_plan.md.
+                # OVMS's T2sCalculator (observed on OVMS 2026.4.1 serving
+                # OpenVINO/Kokoro-82M-int8-ov) always reports
+                # "content-type: application/json" on /v3/audio/speech even
+                # though the body is a genuine WAV stream. The normal header
+                # check below would reject every response from that server as
+                # "non-audio". When the header looks suspicious and a WAV
+                # response was requested, defer the decision to a magic-byte
+                # sniff of the first chunk instead of failing outright.
+                needs_sniff = self._looks_like_json_or_text(response) and self.response_format == "wav"
+                if not needs_sniff:
+                    self._validate_content_type(response)
+                first_chunk = True
                 async for chunk in response.aiter_bytes():
                     if self._cancelled.is_set():
                         return
+                    if first_chunk:
+                        first_chunk = False
+                        if needs_sniff and not chunk.startswith(b"RIFF"):
+                            raise SpeechRequestError("speech endpoint returned a non-audio response")
                     if chunk and not self._publish(results, (True, chunk)):
                         return
         finally:
@@ -187,12 +267,20 @@ class HttpSpeechOperation:
             return True
         return False
 
+    @staticmethod
+    def _looks_like_json_or_text(response: httpx.Response) -> bool:
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            return False
+        media_type = headers.get("content-type", "").partition(";")[0].strip().lower()
+        return media_type.startswith("text/") or media_type == "application/json" or media_type.endswith("+json")
+
     def _validate_content_type(self, response: httpx.Response) -> None:
         headers = getattr(response, "headers", None)
         if headers is None:
             return
         media_type = headers.get("content-type", "").partition(";")[0].strip().lower()
-        if media_type.startswith("text/") or media_type == "application/json" or media_type.endswith("+json"):
+        if self._looks_like_json_or_text(response):
             raise SpeechRequestError("speech endpoint returned a non-audio response")
         response_format = self.response_format
         if response_format not in {"pcm", "wav"}:
@@ -361,6 +449,7 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
         language: str | None = None,
         task_type: str | None = None,
         instructions: str | None = None,
+        style_instructions: bool = False,
         response_format: str = "pcm",
         sample_rate: int = 24000,
         speed: float = 1.0,
@@ -392,6 +481,10 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.language = language
         self.task_type = task_type
         self.instructions = instructions
+        # When enabled, the per-utterance style tag (开心/难过/…) is forwarded as
+        # `instructions`, overriding the fixed value above. Servers such as
+        # CosyVoice's instruct2 use it to change delivery.
+        self.style_instructions = style_instructions
         self.response_format = response_format
         self.sample_rate = sample_rate
         self.speed = speed
@@ -541,6 +634,7 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
                     language=language,
                     use_setup_language=False,
                 )
+            self._apply_style(operation, tts_input.style)
             with self._operation_lock:
                 self._active_operation = operation
             source_chunks = operation.iter_bytes(cancel_check)
@@ -602,6 +696,16 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
         if cancel_generation is None:
             cancel_generation = message.cancel_generation
         return (cancel_generation, message.response_key, message.turn_id, message.turn_revision)
+
+    def _apply_style(self, operation: HttpSpeechOperation, style: str | None) -> None:
+        """Send the utterance style as `instructions`, overriding the configured fixed value.
+
+        Applied to the finished request rather than threaded through `_make_operation` /
+        `_request_payload`, so subclasses that override those with their own payload shape
+        (MiniMax, Drama-3) keep working unchanged.
+        """
+        if style and self.style_instructions and isinstance(operation.payload, dict):
+            operation.payload["instructions"] = style
 
     def _make_operation(
         self,
@@ -703,52 +807,70 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
     def _decode_wav_stream(
         self, encoded_chunks: Iterator[bytes], *, on_first_source_audio: Callable[[], None] | None = None
     ) -> Iterator[np.ndarray]:
+        # NOTE: benchmarking/compat patch — see openvino_dgpu_plan.md.
+        # Python's stdlib `wave` module only understands integer PCM
+        # (format tag 1). Several GenAI speech servers (observed: OVMS
+        # 2026.4.1 serving OpenVINO/Kokoro-82M-int8-ov) return IEEE-float
+        # WAV (format tag 3, 32-bit float samples in [-1, 1]) instead, which
+        # `wave.open()` rejects outright with "unknown format: 3". Parse the
+        # RIFF container ourselves so both integer PCM and float WAV work.
         stream = _StreamingByteReader(encoded_chunks)
         try:
-            wav_reader = wave.open(cast(Any, stream), "rb")
-        except (EOFError, wave.Error) as exc:
+            audio_format, channels, sample_rate, bits_per_sample = _parse_wav_header(stream)
+        except SpeechRequestError:
+            raise
+        except Exception as exc:
             raise SpeechRequestError("speech endpoint returned an invalid WAV stream") from exc
 
-        try:
-            channels = wav_reader.getnchannels()
-            sample_width = wav_reader.getsampwidth()
-            sample_rate = wav_reader.getframerate()
-            if wav_reader.getcomptype() != "NONE" or channels < 1 or sample_width not in {1, 2, 3, 4}:
-                raise SpeechRequestError("speech endpoint returned an unsupported WAV format")
-            source_frames_per_read = max(
-                1024,
-                (self.blocksize * sample_rate + PIPELINE_SAMPLE_RATE - 1) // PIPELINE_SAMPLE_RATE + 64,
+        if channels < 1:
+            raise SpeechRequestError("speech endpoint returned an unsupported WAV format")
+        if audio_format == _WAVE_FORMAT_PCM and bits_per_sample in {8, 16, 24, 32}:
+            sample_width = bits_per_sample // 8
+        elif audio_format == _WAVE_FORMAT_IEEE_FLOAT and bits_per_sample in {32, 64}:
+            sample_width = bits_per_sample // 8
+        else:
+            raise SpeechRequestError(
+                f"speech endpoint returned an unsupported WAV format (format={audio_format}, bits={bits_per_sample})"
             )
 
-            def sample_chunks() -> Iterator[np.ndarray]:
-                byte_remainder = b""
-                frame_size = channels * sample_width
-                # Read one frame first so TTFA does not wait for the larger
-                # block-oriented reads below after provider audio has arrived.
-                first_frame = wav_reader.readframes(1)
-                if first_frame:
-                    usable = len(first_frame) - (len(first_frame) % frame_size)
-                    byte_remainder = first_frame[usable:]
-                    if usable:
-                        yield self._decode_wav_frames(first_frame[:usable], channels, sample_width)
-                while encoded := wav_reader.readframes(source_frames_per_read):
-                    encoded = byte_remainder + encoded
-                    usable = len(encoded) - (len(encoded) % frame_size)
-                    byte_remainder = encoded[usable:]
-                    if usable:
-                        yield self._decode_wav_frames(encoded[:usable], channels, sample_width)
-                if byte_remainder:
-                    logger.warning("Speech endpoint returned an incomplete WAV audio frame")
+        source_frames_per_read = max(
+            1024,
+            (self.blocksize * sample_rate + PIPELINE_SAMPLE_RATE - 1) // PIPELINE_SAMPLE_RATE + 64,
+        )
 
-            yield from self._resample_to_blocks(sample_chunks(), sample_rate, on_first_source_audio)
-        except wave.Error as exc:
-            raise SpeechRequestError("speech endpoint returned an invalid WAV stream") from exc
-        finally:
-            wav_reader.close()
+        def read_frames(n: int) -> bytes:
+            return stream.read(n * channels * sample_width)
+
+        def sample_chunks() -> Iterator[np.ndarray]:
+            byte_remainder = b""
+            frame_size = channels * sample_width
+            # Read one frame first so TTFA does not wait for the larger
+            # block-oriented reads below after provider audio has arrived.
+            first_frame = read_frames(1)
+            if first_frame:
+                usable = len(first_frame) - (len(first_frame) % frame_size)
+                byte_remainder = first_frame[usable:]
+                if usable:
+                    yield self._decode_wav_frames(first_frame[:usable], channels, sample_width, audio_format)
+            while encoded := read_frames(source_frames_per_read):
+                encoded = byte_remainder + encoded
+                usable = len(encoded) - (len(encoded) % frame_size)
+                byte_remainder = encoded[usable:]
+                if usable:
+                    yield self._decode_wav_frames(encoded[:usable], channels, sample_width, audio_format)
+            if byte_remainder:
+                logger.warning("Speech endpoint returned an incomplete WAV audio frame")
+
+        yield from self._resample_to_blocks(sample_chunks(), sample_rate, on_first_source_audio)
 
     @staticmethod
-    def _decode_wav_frames(encoded: bytes, channels: int, sample_width: int) -> np.ndarray:
-        if sample_width == 1:
+    def _decode_wav_frames(encoded: bytes, channels: int, sample_width: int, audio_format: int) -> np.ndarray:
+        if audio_format == _WAVE_FORMAT_IEEE_FLOAT:
+            # Float samples are normalized to [-1, 1]; scale to the int16-ish
+            # magnitude the resampler/PCM16 pipeline downstream expects.
+            dtype = "<f4" if sample_width == 4 else "<f8"
+            waveform = np.frombuffer(encoded, dtype=dtype).astype(np.float64) * 32768.0
+        elif sample_width == 1:
             waveform = (np.frombuffer(encoded, dtype=np.uint8).astype(np.float64) - 128.0) * 256.0
         elif sample_width == 2:
             waveform = np.frombuffer(encoded, dtype="<i2").astype(np.float64)
