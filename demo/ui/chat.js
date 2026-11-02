@@ -6,7 +6,8 @@
  * straight to the `on*` methods here and otherwise doesn't touch chat state.
  *
  * Two parallel surfaces share one shape (see `_buildMessageEl`):
- *   - ephemeral bubbles  (`.bubble` / `.bubble-*`)  fade on a timer
+ *   - ephemeral bubbles  (`.bubble` / `.bubble-*`)  fade on a timer, except the
+ *     reply bubble, which is held until its audio has been heard out in full
  *   - persistent history (`.hist-msg` / `.hist-*`)  the durable panel log
  *
  * Keying:
@@ -20,7 +21,10 @@ import { $, escHtml, DEBUG } from "./dom.js";
 
 const WRENCH_PATH = `<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>`;
 const CHAT_BUBBLE_SVG = `<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`;
-const EMPTY_STATE_HTML = `<div id="chat-empty" class="chat-empty">${CHAT_BUBBLE_SVG}<span class="chat-empty-title">No messages yet</span><span class="chat-empty-hint">Tap the orb and start talking</span></div>`;
+const EMPTY_STATE_HTML = `<div id="chat-empty" class="chat-empty">${CHAT_BUBBLE_SVG}<span class="chat-empty-title">暂无消息</span><span class="chat-empty-hint">点击圆球开始对话</span></div>`;
+// Reply bubbles normally leave on the playback signal. This is only a guard so a
+// lost signal can never strand one on screen permanently.
+const AUDIO_BUBBLE_FAILSAFE_MS = 120_000;
 
 export class ChatView {
   /**
@@ -80,6 +84,14 @@ export class ChatView {
     // bubble) so dismissal is strictly oldest-first regardless of per-bubble delays.
     this._reaperHandle = 0;
 
+    // ── Reply bubbles held until their audio finishes ──────────────────────
+    // `response.done` only means the server stopped generating; the buffered
+    // tail can still be sounding. These bubbles are exempt from the timer reaper
+    // and are released by the audio-drain signal (or the fail-safe). Keyed by
+    // response id so a late signal can never dismiss a newer reply's bubble.
+    /** @type {Map<string, { bubble: HTMLElement, guard: number }>} */
+    this._bubbleAwaitingAudio = new Map();
+
     this._chatBtn.addEventListener("click", () => (this._panelOpen ? this._closePanel() : this._openPanel()));
     this._chatPanelClose.addEventListener("click", () => this._closePanel());
     this._chatPanelBackdrop.addEventListener("click", () => this._closePanel());
@@ -133,7 +145,7 @@ export class ChatView {
   _buildMessageEl({ container, prefix, role, text, partial = false }) {
     const el = document.createElement("div");
     el.className = `${container} ${role}`;
-    const label = role === "user" ? "You" : "Assistant";
+    const label = role === "user" ? "你" : "助手";
     el.innerHTML = `<div class="${prefix}-role">${label}</div><div class="${prefix}-body${partial ? " partial" : ""}"${text ? "" : " hidden"}>${escHtml(text)}</div>`;
     return el;
   }
@@ -192,7 +204,7 @@ export class ChatView {
     el.classList.toggle("listening", state === "listening");
     el.classList.toggle("sending", state === "sending");
     const label = el.querySelector(".voice-turn-state");
-    if (label) label.textContent = state === "listening" ? "Listening…" : "Sending voice…";
+    if (label) label.textContent = state === "listening" ? "正在聆听…" : "正在发送语音…";
   }
 
   /** @param {HTMLElement} el @param {string} text */
@@ -227,6 +239,9 @@ export class ChatView {
    * alive: nothing newer may leave while an older bubble is still on screen. A
    * bubble that keeps updating pushes its own expiry forward, so it (and
    * everything behind it) stays put until it finally goes quiet.
+   *
+   * Bubbles awaiting their reply's audio are skipped rather than blocking the
+   * queue — they leave on the playback signal, not on a timer.
    */
   _reapBubbles() {
     this._reaperHandle = 0;
@@ -234,6 +249,7 @@ export class ChatView {
     const visible = /** @type {HTMLElement[]} */ ([...this._bubbleStack.querySelectorAll(".bubble:not(.out)")]);
     let nextWake = Infinity;
     for (const el of visible) {
+      if (el.dataset.awaitAudio === "1") continue;
       const exp = this._bubbleExpiry.get(el) ?? now; // no expiry recorded → treat as due
       if (exp <= now) {
         this._dismissBubble(el);
@@ -249,15 +265,17 @@ export class ChatView {
   }
 
   /**
-   * Point the shared reaper at the current oldest bubble. This must run when an
-   * expiry moves earlier as well as later: a listening bubble starts with a
-   * long fail-safe, then gets a much shorter deadline once speech stops.
+   * Point the shared reaper at the current oldest bubble that is on a timer.
+   * This must run when an expiry moves earlier as well as later: a listening
+   * bubble starts with a long fail-safe, then gets a much shorter deadline once
+   * speech stops.
    */
   _scheduleBubbleReaper() {
     if (this._reaperHandle) clearTimeout(this._reaperHandle);
     this._reaperHandle = 0;
+    // Bubbles held until their audio drains are exempt from the timer.
     const oldest = /** @type {HTMLElement | null} */ (
-      this._bubbleStack.querySelector(".bubble:not(.out)")
+      this._bubbleStack.querySelector('.bubble:not(.out):not([data-await-audio="1"])')
     );
     if (!oldest) return;
     const expiry = this._bubbleExpiry.get(oldest) ?? Date.now();
@@ -277,6 +295,57 @@ export class ChatView {
   _bumpDismiss(el, delay = 4000) {
     this._bubbleExpiry.set(el, Date.now() + delay);
     this._scheduleBubbleReaper();
+  }
+
+  /**
+   * Keep a reply bubble on screen until its spoken audio finishes, instead of
+   * fading on a fixed timer. The bubble is exempt from the timer reaper until
+   * `onAssistantAudioFinished` (or the fail-safe) releases it — so the caption
+   * stays exactly as long as the voice reading it.
+   * @param {string} responseId @param {HTMLElement} bubble
+   */
+  _holdBubbleForAudio(responseId, bubble) {
+    const held = this._bubbleAwaitingAudio.get(responseId);
+    if (held && held.bubble !== bubble) {
+      // A re-spawned bubble supersedes the old one.
+      clearTimeout(held.guard);
+      delete held.bubble.dataset.awaitAudio;
+      this._bubbleAwaitingAudio.delete(responseId);
+    }
+    const existing = this._bubbleAwaitingAudio.get(responseId);
+    if (existing) clearTimeout(existing.guard);
+    bubble.dataset.awaitAudio = "1";
+    this._bubbleExpiry.delete(bubble);
+    this._bubbleAwaitingAudio.set(responseId, {
+      bubble,
+      guard: setTimeout(() => this.onAssistantAudioFinished(responseId), AUDIO_BUBBLE_FAILSAFE_MS),
+    });
+    this._scheduleBubbleReaper();
+  }
+
+  /**
+   * Take a reply bubble out of the audio hold, optionally fading it right away.
+   * @param {string} responseId @param {boolean} [dismiss]
+   */
+  _releaseBubbleHold(responseId, dismiss = false) {
+    const held = this._bubbleAwaitingAudio.get(responseId);
+    if (!held) return;
+    this._bubbleAwaitingAudio.delete(responseId);
+    clearTimeout(held.guard);
+    delete held.bubble.dataset.awaitAudio;
+    const live = held.bubble.isConnected && !held.bubble.classList.contains("out");
+    if (live && dismiss) this._dismissBubble(held.bubble);
+    else if (live) this._bumpDismiss(held.bubble, 2500); // hand back to the timer
+    this._scheduleBubbleReaper();
+  }
+
+  /**
+   * The reply's buffered audio finished playing: the whole caption has been read
+   * out, so it can now fade.
+   * @param {string} responseId
+   */
+  onAssistantAudioFinished(responseId) {
+    this._releaseBubbleHold(responseId, true);
   }
 
   /**
@@ -362,17 +431,17 @@ export class ChatView {
     const el = document.createElement("div");
     el.className = "hist-msg tool";
     el.innerHTML = `
-      <div class="hist-role">Tool call</div>
+      <div class="hist-role">工具调用</div>
       <button class="hist-tool-header" aria-expanded="false">
         <svg class="hist-tool-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${WRENCH_PATH}</svg>
         <span class="hist-tool-name">${escHtml(name)}</span>
         <svg class="hist-tool-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
       </button>
       <div class="hist-tool-body">
-        <div class="hist-tool-label">Input</div>
+        <div class="hist-tool-label">输入</div>
         <div class="hist-tool-block">${escHtml(pretty)}</div>
-        <div class="hist-tool-label">Output</div>
-        <div class="hist-tool-block hist-tool-output">${escHtml(output || "(no output)")}</div>
+        <div class="hist-tool-label">输出</div>
+        <div class="hist-tool-block hist-tool-output">${escHtml(output || "(无输出)")}</div>
       </div>
     `;
     const header = /** @type {HTMLButtonElement} */ (el.querySelector(".hist-tool-header"));
@@ -393,7 +462,7 @@ export class ChatView {
     hist.classList.add("interrupted");
     const note = document.createElement("div");
     note.className = "hist-note";
-    note.textContent = "Interrupted";
+    note.textContent = "已中断";
     hist.appendChild(note);
   }
 
@@ -404,7 +473,7 @@ export class ChatView {
     if (empty) empty.remove();
     const el = document.createElement("div");
     el.className = "hist-msg tool";
-    el.innerHTML = `<div class="hist-role">Snapshot</div><img class="hist-image" alt="Webcam snapshot sent to the model" />`;
+    el.innerHTML = `<div class="hist-role">截图</div><img class="hist-image" alt="发送给模型的摄像头截图" />`;
     const img = /** @type {HTMLImageElement} */ (el.querySelector("img"));
     img.src = dataUrl;
     this._chatHistory.appendChild(el);
@@ -421,6 +490,11 @@ export class ChatView {
       if (this._activeUserBubble) this._dismissBubble(this._activeUserBubble);
       for (const { bubble } of this._asstByResp.values()) this._dismissBubble(bubble);
     }
+    for (const { bubble, guard } of this._bubbleAwaitingAudio.values()) {
+      clearTimeout(guard);
+      delete bubble.dataset.awaitAudio;
+    }
+    this._bubbleAwaitingAudio.clear();
     this._userHistByItem.clear();
     this._activeUserBubble = null;
     this._activeUserItemId = "";
@@ -518,11 +592,11 @@ export class ChatView {
       if (!entry) {
         const bubble = this._spawnBubble("assistant", d.text);
         this._asstByResp.set(rid, { bubble, hist: this._appendHistMsg("assistant", d.text, false) });
-        this._bumpDismiss(bubble);
+        this._holdBubbleForAudio(rid, bubble);
       } else {
         this._updateBubbleText(entry.bubble, d.text);
         this._updateHistMsg(entry.hist, d.text, false);
-        this._bumpDismiss(entry.bubble);
+        this._holdBubbleForAudio(rid, entry.bubble);
       }
       this._markUnread();
     }
@@ -544,8 +618,8 @@ export class ChatView {
       container = document.createElement("div");
       container.className = "hist-audio";
       container.innerHTML = `
-        <div class="hist-audio-label">Audio sent to the model</div>
-        <audio controls preload="metadata" aria-label="Replay your audio"></audio>
+        <div class="hist-audio-label">已发送给模型的语音</div>
+        <audio controls preload="metadata" aria-label="回放你的语音"></audio>
       `;
       hist.appendChild(container);
     }
@@ -563,13 +637,13 @@ export class ChatView {
     this._userAudioByItem.set(id, { audio, url });
     audio.src = url;
     audio.title = detail.truncated
-      ? "Replay your audio (the beginning was no longer buffered)"
-      : "Replay the audio sent to the model";
+      ? "回放你的语音(开头部分已不再缓存)"
+      : "回放发送给模型的语音";
     const label = container.querySelector(".hist-audio-label");
     if (label) {
       label.textContent = detail.truncated
-        ? "Audio sent to the model · beginning unavailable"
-        : "Audio sent to the model";
+        ? "已发送给模型的语音 · 开头部分不可用"
+        : "已发送给模型的语音";
     }
 
     if (isNewPlayer) {
@@ -595,7 +669,7 @@ export class ChatView {
 
   /**
    * A response closed (completed or cancelled).
-   * @param {{ responseId: string; status: string; audible?: boolean; transcript?: string; latency?: import("../turn-latency.js").TurnLatency | null }} detail
+   * @param {{ responseId: string; status: string; audible?: boolean; transcript?: string; latency?: import("../turn-latency.js").TurnLatency | null; clientTiming?: import("../client-latency.js").ClientLatencySummary | null }} detail
    */
   onResponseFinished(detail) {
     const { responseId, status, audible, transcript } = detail;
@@ -606,9 +680,9 @@ export class ChatView {
     if (!responseId) return;
     const entry = this._asstByResp.get(responseId);
     let hist = entry?.hist ?? null;
-    if (detail.latency) {
+    if (detail.latency || detail.clientTiming) {
       hist ??= this._appendHistMsg("assistant", transcript || "", false);
-      this._appendTimings(hist, detail.latency);
+      this._appendTimings(hist, detail.latency, detail.clientTiming);
       this._markUnread();
     }
 
@@ -623,58 +697,140 @@ export class ChatView {
       }
       if (hist) this._markHistInterrupted(hist);
       this._asstByResp.delete(responseId);
+      this._releaseBubbleHold(responseId, true);
       return;
     }
 
-    // Any other terminal close (completed / failed / incomplete / …): just
-    // release the map entry. The bubble already auto-dismisses on its timer and
-    // the history row persists as the conversation log. Crucially we do NOT
-    // touch user state here — that lifecycle is fully independent.
+    // Any other terminal close (completed / failed / incomplete / …). The bubble
+    // was put on an audio hold when the transcript arrived and normally stays
+    // until its playback drains. Only when the response produced no audio is
+    // there nothing to wait for, so hand it back to the readable timer. Keep the
+    // history row as the durable log; user state is untouched — that lifecycle
+    // is fully independent.
+    if (audible === false) this._releaseBubbleHold(responseId);
     this._asstByResp.delete(responseId);
   }
 
-  /** @param {HTMLElement} hist @param {import("../turn-latency.js").TurnLatency} timing */
-  _appendTimings(hist, timing) {
+  /**
+   * @param {HTMLElement} hist
+   * @param {import("../turn-latency.js").TurnLatency | null} timing Server timings, when reported.
+   * @param {import("../client-latency.js").ClientLatencySummary | null | undefined} clientTiming Browser-measured timings.
+   */
+  _appendTimings(hist, timing, clientTiming) {
     /** @param {number|null|undefined} seconds */
-    const format = (seconds) => seconds == null ? "Unavailable" : `${seconds.toFixed(2)} s`;
+    const format = (seconds) => seconds == null ? "不可用" : `${seconds.toFixed(2)} 秒`;
     const details = document.createElement("details");
     details.className = "hist-timings";
     const summary = document.createElement("summary");
-    summary.textContent = timing.e2e_s === null
-      ? "Server timings"
-      : `Server timings · ${timing.version === 2 ? "E2E" : "First audio"} ${format(timing.e2e_s)}`;
+    const headlineMs = clientTiming?.firstSentence?.textToPlaybackMs;
+    const serverE2e = timing ? timing.e2e_s : null;
+    const headline = headlineMs != null ? `首句出声 ${(headlineMs / 1000).toFixed(2)} 秒` : null;
+    const server = serverE2e != null ? `端到端 ${format(serverE2e)}` : null;
+    summary.textContent = ["延迟明细", headline, server].filter(Boolean).join(" · ");
     details.appendChild(summary);
-    const status = document.createElement("p");
-    status.className = "timing-status";
-    status.textContent = ({ completed: "Completed", cancelled: "Interrupted", failed: "Failed", incomplete: "Incomplete" })[timing.status];
-    details.appendChild(status);
-    const list = document.createElement("dl");
-    /** @type {[string, number|null|undefined|string][]} */
-    const stages = [
-      [timing.version === 2 ? "E2E time" : "VAD handoff to first audio", timing.e2e_s],
-      ["VAD end decision", timing.vad_decision_s],
-      ["Smart Turn decision", timing.smart_status],
-      ["Transcription", timing.stt_s],
-      ["Response generation", timing.llm_s],
-      ["Voice synthesis to first audio", timing.tts_ttfa_s],
-      ["Hold time before response", timing.version === 2 ? timing.hold_s : timing.smart_wait_s],
-    ];
-    for (const [label, value] of stages) {
-      const term = document.createElement("dt");
-      term.textContent = label;
-      const description = document.createElement("dd");
-      description.textContent = typeof value === "string" ? value : format(value);
-      list.append(term, description);
+
+    if (timing) {
+      const status = document.createElement("p");
+      status.className = "timing-status";
+      status.textContent = `服务器 · ${({ completed: "已完成", cancelled: "已中断", failed: "失败", incomplete: "未完成" })[timing.status]}`;
+      details.appendChild(status);
+      const list = document.createElement("dl");
+      /** @type {[string, number|null|undefined|string][]} */
+      const stages = [
+        [timing.version === 2 ? "端到端耗时" : "VAD 到首次出声", timing.e2e_s],
+        ["VAD 结束判定", timing.vad_decision_s],
+        ["智能断句判定", timing.smart_status],
+        ["语音识别", timing.stt_s],
+        ["回复生成", timing.llm_s],
+        ["语音合成到首次出声", timing.tts_ttfa_s],
+        ["响应前等待时间", timing.version === 2 ? timing.hold_s : timing.smart_wait_s],
+      ];
+      for (const [label, value] of stages) {
+        const term = document.createElement("dt");
+        term.textContent = label;
+        const description = document.createElement("dd");
+        description.textContent = typeof value === "string" ? value : format(value);
+        list.append(term, description);
+      }
+      details.appendChild(list);
+      const note = document.createElement("p");
+      note.textContent = timing.version === 2
+        ? "端到端:从预估语音结束到生成首个音频,不含浏览器播放耗时。各阶段有重叠,不可直接相加。"
+        : "首次出声:从 VAD 交接到生成音频,不含浏览器播放耗时。各阶段有重叠,不可直接相加。";
+      details.appendChild(note);
     }
-    details.appendChild(list);
-    const note = document.createElement("p");
-    note.textContent = timing.version === 2
-      ? "E2E: estimated speech end to first generated audio, excluding browser playback. Stages overlap and do not add up."
-      : "First audio: VAD handoff to generated audio, excluding browser playback. Stages overlap and do not add up.";
-    details.appendChild(note);
+
+    if (clientTiming) details.appendChild(this._buildClientTimings(clientTiming, format));
+
     hist.querySelector(".hist-timings")?.remove();
     hist.appendChild(details);
     this._scrollToBottom();
+  }
+
+  /**
+   * Render the browser-measured section: header metrics plus per-sentence rows.
+   * @param {import("../client-latency.js").ClientLatencySummary} clientTiming
+   * @param {(seconds: number|null|undefined) => string} format
+   */
+  _buildClientTimings(clientTiming, format) {
+    const block = document.createElement("div");
+    block.className = "timing-client";
+    const status = document.createElement("p");
+    status.className = "timing-status";
+    status.textContent = "客户端实测 · 含网络与浏览器播放缓冲";
+    block.appendChild(status);
+
+    const first = clientTiming.firstSentence;
+    const list = document.createElement("dl");
+    /** @type {[string, number|null][]} */
+    const headlines = [
+      ["首句 文字首字→实际出声", first ? first.textToPlaybackMs : null],
+      ["首句 文字首字→音频送达", first ? first.textToAudioMs : null],
+    ];
+    for (const [label, ms] of headlines) {
+      const term = document.createElement("dt");
+      term.textContent = label;
+      const description = document.createElement("dd");
+      description.textContent = ms == null ? "不可用" : format(ms / 1000);
+      list.append(term, description);
+    }
+    block.appendChild(list);
+
+    if (clientTiming.sentences.length) {
+      const title = document.createElement("p");
+      title.className = "timing-status";
+      title.textContent = "每句：文字首字 → 实际出声";
+      block.appendChild(title);
+      const sentences = document.createElement("ol");
+      sentences.className = "timing-sentences";
+      const shown = clientTiming.sentences.slice(0, 8);
+      for (const sentence of shown) {
+        const item = document.createElement("li");
+        const text = document.createElement("span");
+        text.className = "timing-sentence-text";
+        text.textContent = sentence.text.trim();
+        const value = document.createElement("span");
+        value.className = "timing-sentence-value";
+        const textAt = sentence.textAtMs == null ? "?" : `${(sentence.textAtMs / 1000).toFixed(2)}s`;
+        const playAt = sentence.playbackAtMs == null ? "?" : `${(sentence.playbackAtMs / 1000).toFixed(2)}s`;
+        const delta = sentence.textToPlaybackMs == null ? "不可用" : `+${(sentence.textToPlaybackMs / 1000).toFixed(2)}s`;
+        value.textContent = `文字 ${textAt} → 出声 ${playAt}（${delta}）`;
+        item.append(text, value);
+        sentences.appendChild(item);
+      }
+      block.appendChild(sentences);
+      if (clientTiming.sentences.length > shown.length) {
+        const more = document.createElement("p");
+        more.className = "timing-status";
+        more.textContent = `其余 ${clientTiming.sentences.length - shown.length} 句未展开`;
+        block.appendChild(more);
+      }
+    }
+
+    const note = document.createElement("p");
+    note.textContent = "出声时刻按音频采样时间线推算,前提是播放不中断;与服务器「语音合成到首次出声」口径不同。";
+    block.appendChild(note);
+    return block;
   }
 
   /** The model called a tool — show an ephemeral "running" bubble.
