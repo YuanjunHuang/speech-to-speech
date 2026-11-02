@@ -34,6 +34,13 @@ class OpenAICompatibleTTSHandlerArguments:
         default=None,
         metadata={"help": "Optional voice style instructions for compatible servers."},
     )
+    openai_tts_style_instructions: bool = field(
+        default=False,
+        metadata={
+            "help": "Forward the per-utterance style tag (开心/难过/…) as `instructions`, "
+            "overriding openai_tts_instructions. Used by the local CosyVoice bridge."
+        },
+    )
     openai_tts_response_format: str = field(
         default="pcm",
         metadata={"help": "Audio response format. The adapter currently supports pcm and wav."},

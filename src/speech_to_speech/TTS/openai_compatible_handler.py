@@ -449,6 +449,7 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
         language: str | None = None,
         task_type: str | None = None,
         instructions: str | None = None,
+        style_instructions: bool = False,
         response_format: str = "pcm",
         sample_rate: int = 24000,
         speed: float = 1.0,
@@ -480,6 +481,10 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.language = language
         self.task_type = task_type
         self.instructions = instructions
+        # When enabled, the per-utterance style tag (开心/难过/…) is forwarded as
+        # `instructions`, overriding the fixed value above. Servers such as
+        # CosyVoice's instruct2 use it to change delivery.
+        self.style_instructions = style_instructions
         self.response_format = response_format
         self.sample_rate = sample_rate
         self.speed = speed
@@ -629,6 +634,7 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
                     language=language,
                     use_setup_language=False,
                 )
+            self._apply_style(operation, tts_input.style)
             with self._operation_lock:
                 self._active_operation = operation
             source_chunks = operation.iter_bytes(cancel_check)
@@ -690,6 +696,16 @@ class OpenAICompatibleTTSHandler(BaseHandler[TTSIn, TTSOut]):
         if cancel_generation is None:
             cancel_generation = message.cancel_generation
         return (cancel_generation, message.response_key, message.turn_id, message.turn_revision)
+
+    def _apply_style(self, operation: HttpSpeechOperation, style: str | None) -> None:
+        """Send the utterance style as `instructions`, overriding the configured fixed value.
+
+        Applied to the finished request rather than threaded through `_make_operation` /
+        `_request_payload`, so subclasses that override those with their own payload shape
+        (MiniMax, Drama-3) keep working unchanged.
+        """
+        if style and self.style_instructions and isinstance(operation.payload, dict):
+            operation.payload["instructions"] = style
 
     def _make_operation(
         self,

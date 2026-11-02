@@ -17,12 +17,15 @@
  * @typedef {S2sRealtimeClient} RealtimeClient
  */
 
-import { S2sRealtimeClient, normalizePlaybackBufferMs } from "./s2s-realtime-client.js?v=audio-24k-v2";
+import { S2sRealtimeClient, normalizePlaybackBufferMs } from "./s2s-realtime-client.js?v=audio-24k-v5";
 import { $, truncateError, errorMessage, DEBUG } from "./ui/dom.js";
-import { ChatView } from "./ui/chat.js";
+import { ChatView } from "./ui/chat.js?v=bubble-hold-v1";
 import { Account } from "./ui/account.js";
+import { initSystemInfo, setStageModule, setTtsModule } from "./ui/system-info.js?v=sysinfo-v9";
+import { initStylePicker } from "./ui/style-picker.js?v=style-v3";
+import { createTtsEnginePicker } from "./tts-engine.js?v=engine-v2";
 
-const DEFAULT_VOICE = "Aiden";
+const DEFAULT_VOICE = "Vivian";
 const DEFAULT_INSTRUCTIONS = "You are a friendly voice assistant.";
 
 const STORAGE_KEYS = {
@@ -34,7 +37,10 @@ const STORAGE_KEYS = {
   tools: "s2s.ws.tools",
   searchKey: "s2s.ws.searchKey",
   noiseGate: "s2s.ws.noiseGate",
-  playbackBufferMs: "s2s.ws.playbackBufferMs",
+  // ".v2": the default moved 0 -> 500 ms when the backend became Qwen3-TTS,
+  // whose audio arrives in ~0.5 s bursts; a stored 0 would keep the old choppy
+  // start. New key, so existing browsers pick up the new default once.
+  playbackBufferMs: "s2s.ws.playbackBufferMs.v2",
   localVad: "s2s.audio.localVad",
   // "ws" | "webrtc". Not under the historical "s2s.ws." prefix — it selects
   // between the transports rather than configuring the WS one.
@@ -153,16 +159,17 @@ function saveSettings(s) {
 function loadTools() {
   try {
     const raw = JSON.parse(localStorage.getItem(STORAGE_KEYS.tools) || "{}");
-    // Both tools default ON (web search still only activates when a key exists).
-    // We never call getUserMedia on page load — the camera only actually starts
-    // on a user gesture (conversation start), so a default-on flag doesn't
-    // silently resume the webcam; an explicit saved `false` is respected.
+    // Web search defaults ON (it still only activates when a key exists).
+    // Camera defaults OFF: showing a live self-view and silently requesting
+    // camera permission on every page load is surprising, and the active LLM
+    // backend may not even be a vision-language model that can use the frame.
+    // The user can still switch it on from the Tools panel.
     return {
       web_search: raw.web_search ?? true,
-      camera_snapshot: raw.camera_snapshot ?? true,
+      camera_snapshot: raw.camera_snapshot ?? false,
     };
   } catch {
-    return { web_search: true, camera_snapshot: true };
+    return { web_search: true, camera_snapshot: false };
   }
 }
 
@@ -172,15 +179,15 @@ function saveTools() {
 
 /** @type {Record<AppState, { caption: string; disabled: boolean }>} */
 const STATE_VIEWS = {
-  idle:            { caption: "Tap to start",  disabled: false },
-  connecting:      { caption: "Connecting",    disabled: true  },
-  queued:          { caption: "Finding you a spot…", disabled: true },
-  "your-turn":     { caption: "You're up! 🎉", disabled: true  },
+  idle:            { caption: "点击开始",      disabled: false },
+  connecting:      { caption: "连接中",        disabled: true  },
+  queued:          { caption: "正在为你寻找空位…", disabled: true },
+  "your-turn":     { caption: "轮到你了!🎉", disabled: true  },
   listening:       { caption: "",              disabled: false },
   "user-speaking": { caption: "",              disabled: false },
   processing:      { caption: "",              disabled: false },
   "ai-speaking":   { caption: "",              disabled: false },
-  error:           { caption: "Tap to retry",  disabled: false },
+  error:           { caption: "点击重试",      disabled: false },
 };
 
 /** @type {Record<AppState, string>} */
@@ -281,6 +288,44 @@ const inputAudioInput = $("#audio-input");
 const inputAudioOutput = $("#audio-output");
 /** @type {HTMLElement} */
 const audioOutputHint = $("#audio-output-hint");
+const audioTestBtn = $("#audio-test");
+const audioTestStatus = $("#audio-test-status");
+
+// Plays a short two-tone beep through a fresh AudioContext on the chosen output,
+// entirely client-side. It separates "the browser/speaker is silent" from "the
+// pipeline sent no audio" without needing a microphone or a server round trip.
+audioTestBtn.addEventListener("click", async () => {
+  const say = (text, kind) => {
+    audioTestStatus.hidden = !text;
+    audioTestStatus.textContent = text;
+    audioTestStatus.dataset.kind = kind;
+  };
+  try {
+    const Ctx = window.AudioContext || /** @type {any} */ (window).webkitAudioContext;
+    const ctx = new Ctx();
+    await ctx.resume();
+    const sink = inputAudioOutput.value || "";
+    let sinkNote = "系统默认设备";
+    if (typeof /** @type {any} */ (ctx).setSinkId === "function" && sink) {
+      await /** @type {any} */ (ctx).setSinkId(sink);
+      sinkNote = inputAudioOutput.selectedOptions[0]?.textContent || sink;
+    }
+    const gain = ctx.createGain();
+    gain.gain.value = 0.2;
+    gain.connect(ctx.destination);
+    [660, 880].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      osc.frequency.value = freq;
+      osc.connect(gain);
+      osc.start(ctx.currentTime + i * 0.35);
+      osc.stop(ctx.currentTime + i * 0.35 + 0.3);
+    });
+    say(`已向「${sinkNote}」播放提示音（AudioContext: ${ctx.state}, ${ctx.sampleRate} Hz）。听到了吗？`, "ok");
+    setTimeout(() => void ctx.close().catch(() => {}), 1500);
+  } catch (err) {
+    say(`播放失败：${err instanceof Error ? err.message : err}`, "error");
+  }
+});
 /** @type {HTMLTextAreaElement} */
 const inputInstructions = $("#instructions");
 /** @type {HTMLInputElement} */
@@ -382,6 +427,71 @@ const chat = new ChatView({
 // server meters conversation time; the client just heartbeats a live session
 // and tears down when the server reports the budget is spent.
 const account = new Account();
+
+// ── System info rail ──────────────────────────────────────────────────────
+// Renders the inference-host hardware inventory and the stage→device map into
+// the left rail, and wires the topbar toggle / drawer affordances.
+initSystemInfo();
+
+// ── Voice style picker ────────────────────────────────────────────────────
+// 情绪固定：所选情绪作为 Realtime session 的扩展字段下发，后端优先采用它
+// （见 LLM/lm_output_processor.py::_session_style）；"自动" 则由模型自己打标签。
+// `client` is declared *before* the picker initialises on purpose: initStylePicker
+// calls back once with the stored pin, and that callback reads `client`. Declaring
+// it below would leave `client` in the temporal dead zone, throw a ReferenceError,
+// and abort this whole module — which silently kills the start button.
+/** @type {RealtimeClient | null} */
+let client = null;
+// The pin is also re-applied on every (re)connect, so a session always carries it.
+const stylePin = initStylePicker((style) => {
+  if (client) client.setStyle(style);
+});
+
+// ── TTS engine picker ─────────────────────────────────────────────────────
+// Qwen3-TTS vs the CosyVoice bridge. The backend is a startup flag, so a switch
+// restarts the pipeline through tts_supervisor.py (:8790 via Caddy /tts-admin).
+// We do NOT auto-reconnect afterwards: resuming an AudioContext outside a user
+// gesture can leave it suspended, so the user starts the next call themselves.
+// The STT backend is chosen by the pipeline launcher and reported by the supervisor
+// (it can fall back to whisper), so the rail must follow it rather than be hardcoded.
+// The LLM is whatever OVMS :8000 serves; known models get a tidy label, anything
+// else is shown by its served id rather than hidden behind a stale name.
+const LLM_PANEL = {
+  "minicpm-v-4_5-int4-g-ov": "MiniCPM-V 4.5 · INT4",
+  "minicpm-v-4_5-int4-cw-ov": "MiniCPM-V 4.5 · INT4 (cw)",
+  "qwen3-8b-int4-ov": "Qwen3-8B · INT4",
+  "qwen3.5-4b-int8-ov": "Qwen3.5-4B · INT8",
+};
+
+const STT_PANEL = {
+  qwen3asr: { name: "Qwen3-ASR-0.6B · INT8", job: "语音转文字", detail: "OpenVINO · CPU", device: "cpu" },
+  whisper: { name: "whisper-small · INT8", job: "语音转文字", detail: "OVMS :8001", device: "gpu1" },
+};
+
+const TTS_PANEL = {
+  qwen3: { name: "Qwen3-TTS · 1.7B CustomVoice", job: "语音合成 · 情绪 instruct", detail: "GGML", device: "cpu" },
+  cosyvoice2: { name: "CosyVoice2 · 0.5B", job: "语音合成 · 整段渲染", detail: "PyTorch · HTTP bridge", device: "cpu" },
+  cosyvoice3: { name: "CosyVoice3 · 0.5B", job: "语音合成 · 逐句", detail: "LLM·CPU · flow/HiFT·A770", device: "gpu1" },
+};
+
+const ttsEngine = createTtsEnginePicker({
+  select: /** @type {HTMLSelectElement} */ ($("#tts-engine")),
+  hint: /** @type {HTMLElement} */ ($("#tts-engine-hint")),
+  status: /** @type {HTMLElement} */ ($("#tts-engine-status")),
+  voiceSelect: inputVoice,
+  onSwitchStart: async () => {
+    if (client) await teardown();
+  },
+  onActive: (engine, state) => {
+    const info = TTS_PANEL[engine];
+    if (info) setTtsModule(info);
+    const stt = state?.stt && STT_PANEL[state.stt.id];
+    if (stt) setStageModule("STT", stt);
+    const llmId = state?.llm?.id;
+    if (llmId) setStageModule("LLM", { name: LLM_PANEL[llmId] || llmId });
+  },
+});
+void ttsEngine.refresh();
 let limiterOn = false;
 let heartbeatTimer = 0;
 let trackedSessionId = "";
@@ -390,8 +500,6 @@ let trackedTier = "";
 // queue on teardown / tab-close so we don't hold a phantom place.
 let queuedTicketId = "";
 
-/** @type {RealtimeClient | null} */
-let client = null;
 /** @type {MediaStream | null} */
 let micStream = null;
 let micMuted = false;
@@ -434,7 +542,7 @@ function setState(next) {
   // Warm reassurance under the terse position, only while waiting in line.
   if (next === "queued") {
     circleSubcaption.textContent =
-      "Sorry, we overhugged! 🤗 Every slot is busy, so we saved you a spot. Hang tight, you're moving up.";
+      "抱歉,我们被挤爆啦!🤗 当前所有坑位都满了,已经为你保留了一个位置,马上就好。";
     circleSubcaption.hidden = false;
   } else {
     circleSubcaption.hidden = true;
@@ -451,8 +559,8 @@ function updateRestartAvailability() {
     currentState === "connecting" || currentState === "queued" || currentState === "your-turn";
   restartHint.hidden = false;
   restartHint.textContent = LIVE_STATES.has(currentState)
-    ? "Reconnects now with the settings above."
-    : "Starts a conversation with the settings above.";
+    ? "使用以上设置立即重新连接。"
+    : "使用以上设置开始一次对话。";
 }
 
 /**
@@ -474,6 +582,9 @@ function openSettings() {
   syncGateUi();
   updateRestartAvailability();
   void refreshAudioDeviceLists();
+  // The stack can be switched from another tab (or by a restore), so re-read
+  // the supervisor every time the dialog opens.
+  void ttsEngine.refresh();
   settingsModal.showModal();
 }
 
@@ -629,16 +740,16 @@ function syncToolsUi() {
   if (serverSearchKey) {
     // Key lives server-side: show it as configured, never expose it.
     searchKeyInput.value = "";
-    searchKeyInput.placeholder = "••••••••  · provided by the server";
+    searchKeyInput.placeholder = "••••••••  · 由服务器提供";
     searchKeyInput.disabled = true;
-    toolWebHint.textContent = "Ready. The search key is held server-side and never sent to your browser.";
+    toolWebHint.textContent = "已就绪。搜索密钥保存在服务器端,不会发送到你的浏览器。";
   } else {
     searchKeyInput.disabled = false;
     searchKeyInput.value = userSearchKey;
-    searchKeyInput.placeholder = "Paste a Serper key to enable web search";
+    searchKeyInput.placeholder = "粘贴一个 Serper 密钥以启用网络搜索";
     toolWebHint.textContent = userSearchKey
-      ? "Using your key — stored in this browser only."
-      : "No server key configured. Add your own Serper key to enable web search.";
+      ? "正在使用你的密钥——仅保存在本浏览器中。"
+      : "服务器未配置密钥。添加你自己的 Serper 密钥以启用网络搜索。";
   }
 }
 
@@ -668,16 +779,16 @@ toolCamSwitch.addEventListener("change", async () => {
       toolCamSwitch.checked = false;
       const denied = err instanceof Error && (err.name === "NotAllowedError" || err.name === "SecurityError");
       toolCamHint.textContent = denied
-        ? "Camera blocked. Allow it from the camera icon in your browser's address bar — it switches on automatically."
-        : `Camera unavailable${err instanceof Error ? `: ${err.message}` : ""}`;
+        ? "摄像头被阻止了。请在浏览器地址栏的摄像头图标处允许访问,它会自动打开。"
+        : `摄像头不可用${err instanceof Error ? `:${err.message}` : ""}`;
       return;
     }
     toolsEnabled.camera_snapshot = true;
-    toolCamHint.textContent = "Camera on. The assistant can take a snapshot when it needs to see.";
+    toolCamHint.textContent = "摄像头已开启。助手需要时可以拍一张照片看看。";
   } else {
     disableCamera();
     toolsEnabled.camera_snapshot = false;
-    toolCamHint.textContent = "Let the assistant see through your webcam.";
+    toolCamHint.textContent = "让助手通过你的摄像头“看到”画面。";
   }
   saveTools();
   pushToolsToSession();
@@ -700,14 +811,15 @@ searchKeyInput.addEventListener("input", () => {
     pushToolsToSession();
   }
   toolWebHint.textContent = userSearchKey
-    ? "Using your key — stored in this browser only."
-    : "No server key configured. Add your own Serper key to enable web search.";
+    ? "正在使用你的密钥——仅保存在本浏览器中。"
+    : "服务器未配置密钥。添加你自己的 Serper 密钥以启用网络搜索。";
 });
 
 // ── Camera ──────────────────────────────────────────────────────────────────
 
 async function enableCamera() {
   if (cameraStream) return;
+  assertCaptureContext();
   cameraStream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: "user" },
     audio: false,
@@ -732,9 +844,9 @@ function disableCamera() {
   document.body.classList.remove("cam-on");
 }
 
-/** Auto-start the webcam on arrival (the camera tool is on by default). If the
- *  user declines the permission, switch the tool off and reflect it in the UI
- *  rather than nagging. */
+/** Starts the webcam only when the camera tool is explicitly enabled (it
+ *  defaults off — see loadTools). If the user declines the permission,
+ *  switch the tool off and reflect it in the UI rather than nagging. */
 async function autoStartCamera() {
   if (!toolsEnabled.camera_snapshot || cameraStream) return;
   try {
@@ -851,25 +963,25 @@ async function runTool(name, argsJson, callId) {
       const dataUrl = captureSnapshot();
       if (dataUrl) {
         if (DEBUG) console.debug(`[tool] camera_snapshot captured frame (${dataUrl.length} chars), sending image + output`);
-        result = { output: "Snapshot captured from the webcam and attached as an image.", image: dataUrl };
+        result = { output: "已从摄像头拍摄照片并作为图片附上。", image: dataUrl };
         flashPreview();
       } else {
         console.warn("[tool] camera_snapshot: no frame — camera off or not ready");
-        result.output = "The camera is not available right now.";
+        result.output = "摄像头当前不可用。";
       }
     } else {
-      result.output = `Unknown tool: ${name}`;
+      result.output = `未知工具:${name}`;
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    result.output = `Tool failed: ${msg}`;
+    result.output = `工具执行失败:${msg}`;
   }
   return result;
 }
 
 /** @param {string} query @returns {Promise<string>} */
 async function execWebSearch(query) {
-  if (!query) return "No query provided.";
+  if (!query) return "未提供查询内容。";
   /** @type {Record<string, string>} */
   const body = { query };
   // Only send a user key when there's no server key (server prefers its own).
@@ -885,19 +997,19 @@ async function execWebSearch(query) {
   if (!res.ok) {
     let detail = String(res.status);
     try { const j = await res.json(); if (j.detail) detail = j.detail; } catch {}
-    throw new Error(`search error (${detail})`);
+    throw new Error(`搜索出错(${detail})`);
   }
   const json = await res.json();
   // Date-stamp the header so the model treats these as fresh realtime facts
   // rather than its (older) training knowledge.
   const today = new Date().toISOString().slice(0, 10);
   /** @type {string[]} */
-  const lines = [`Google search result from ${today}:`];
-  if (json.answer) lines.push(`Answer: ${json.answer}`);
+  const lines = [`Google 搜索结果,日期 ${today}:`];
+  if (json.answer) lines.push(`答案:${json.answer}`);
   for (const r of json.results || []) {
-    lines.push(`- ${r.title}: ${r.snippet} (${r.url})`);
+    lines.push(`- ${r.title}:${r.snippet}(${r.url})`);
   }
-  return lines.length > 1 ? lines.join("\n") : `${lines[0]}\nNo results found.`;
+  return lines.length > 1 ? lines.join("\n") : `${lines[0]}\n未找到结果。`;
 }
 
 /** Learn server config (search key + connection target), then refresh the UI. */
@@ -947,7 +1059,7 @@ function connectionTarget() {
   }
   const directUrl = buildDirectWsUrl(pinnedUrl || settings.directUrl);
   if (!directUrl) {
-    throw new Error("Enter a speech-to-speech server URL in Settings.");
+    throw new Error("请在设置中填写 speech-to-speech 服务器地址。");
   }
   return { directUrl };
 }
@@ -973,6 +1085,18 @@ function buildDirectWsUrl(raw) {
   try {
     const u = new URL(s);
     if (u.pathname === "" || u.pathname === "/") u.pathname = "/v1/realtime";
+    // An https page may only open wss:// (mixed content), and this deploy puts
+    // Caddy in front of the s2s socket on the same host, so a pinned ws:// URL
+    // for this machine is re-homed onto the page's own origin. The .crt for the
+    // LAN IP comes from Caddy's local CA; without trust in it only http works.
+    if (
+      location.protocol === "https:" &&
+      u.protocol === "ws:" &&
+      u.hostname === location.hostname
+    ) {
+      u.protocol = "wss:";
+      u.host = location.host;
+    }
     return u.toString();
   } catch {
     return s;
@@ -1046,8 +1170,8 @@ function syncTransportUi() {
   inputTransport.disabled = !selectable;
   inputTransport.value = selectable && settings.transport === "webrtc" ? "webrtc" : "ws";
   transportHint.textContent = selectable
-    ? "How audio travels to the server. Applies on the next conversation."
-    : "WebRTC needs a server URL pinned by the deployment (SPEECH_TO_SPEECH_URL).";
+    ? "音频传输到服务器的方式。下一次对话生效。"
+    : "WebRTC 需要部署方固定一个服务器地址(SPEECH_TO_SPEECH_URL)。";
   gateField.hidden = effectiveTransport() === "webrtc";
   playbackBufferField.hidden = effectiveTransport() === "webrtc";
 }
@@ -1061,16 +1185,16 @@ function syncConnectionUi() {
     inputLbUrl.value = pinnedUrl;
     inputLbUrl.readOnly = true;
     connHint.classList.remove("error");
-    connHint.textContent = "Speech-to-speech server URL pinned by this deployment.";
+    connHint.textContent = "本次部署已固定 speech-to-speech 服务器地址。";
   } else if (allowDirect) {
     // Direct mode: the user sets their own s2s server URL.
     connField.hidden = false;
     inputLbUrl.value = settings.directUrl;
     inputLbUrl.readOnly = false;
-    inputLbUrl.placeholder = "http://localhost:port";
+    inputLbUrl.placeholder = "http://localhost:端口号";
     connHint.classList.remove("error");
     connHint.textContent =
-      "URL of your speech-to-speech server, e.g. http://localhost:8080 (the app adds /v1/realtime).";
+      "你的 speech-to-speech 服务器地址,例如 http://localhost:8080(应用会自动加上 /v1/realtime)。";
   } else {
     // LB mode: the load balancer URL is deployment-owned — hide it entirely so
     // its address is never exposed in Settings.
@@ -1088,7 +1212,7 @@ function missingServerUrl() {
 function promptServerUrl() {
   if (settingsModal.open) syncConnectionUi();
   else openSettings();
-  connHint.textContent = "Set the speech-to-speech server URL to start.";
+  connHint.textContent = "请先设置 speech-to-speech 服务器地址才能开始。";
   connHint.classList.add("error");
   inputLbUrl.focus();
 }
@@ -1162,7 +1286,7 @@ async function handleStartError(err) {
   if (err && err.code === "login-required") {
     await teardown();
     setState("error");
-    setCaption("Sign in again to continue.", "error");
+    setCaption("请重新登录以继续。", "error");
     account.showLoginRequired(err.loginUrl);
     return;
   }
@@ -1187,8 +1311,8 @@ async function handleStartError(err) {
     setState("error");
     setCaption(
       err.code === "join-expired"
-        ? "Your spot expired. Tap to rejoin."
-        : "That took a while. Tap to rejoin.",
+        ? "你的名额已过期,点击重新加入。"
+        : "等待时间太久了,点击重新加入。",
       "error",
     );
     return;
@@ -1201,8 +1325,8 @@ micBtn.addEventListener("click", () => {
   micMuted = !micMuted;
   syncMicMuteState();
   micBtn.classList.toggle("muted", micMuted);
-  micBtn.setAttribute("aria-label", micMuted ? "Unmute" : "Mute");
-  micBtn.title = micMuted ? "Unmute" : "Mute";
+  micBtn.setAttribute("aria-label", micMuted ? "取消静音" : "静音");
+  micBtn.title = micMuted ? "取消静音" : "静音";
 });
 
 stopBtn.addEventListener("click", async () => {
@@ -1253,8 +1377,8 @@ async function refreshAudioDeviceLists() {
   const canPickOutput = supportsAudioOutputSelection();
   inputAudioOutput.disabled = !canPickOutput;
   audioOutputHint.textContent = canPickOutput
-    ? "Where assistant audio plays. Can change live while connected."
-    : "Speaker selection needs a browser with AudioContext.setSinkId (Chrome/Edge).";
+    ? "助手语音的播放设备。连接中也可以实时切换。"
+    : "选择扬声器需要支持 AudioContext.setSinkId 的浏览器(Chrome/Edge)。";
 
   /** @type {MediaDeviceInfo[]} */
   let devices = [];
@@ -1268,8 +1392,8 @@ async function refreshAudioDeviceLists() {
   const outputs = devices.filter((d) => d.kind === "audiooutput");
   const labelsReady = devices.some((d) => d.label);
 
-  fillDeviceSelect(inputAudioInput, inputs, settings.audioInputId, "Microphone");
-  fillDeviceSelect(inputAudioOutput, outputs, settings.audioOutputId, "Speaker");
+  fillDeviceSelect(inputAudioInput, inputs, settings.audioInputId, "麦克风");
+  fillDeviceSelect(inputAudioOutput, outputs, settings.audioOutputId, "扬声器");
 
   if (!labelsReady) {
     // Permission unlocks real device names; keep it quiet — user can tap Start
@@ -1277,11 +1401,11 @@ async function refreshAudioDeviceLists() {
     const hint = inputAudioInput.parentElement?.querySelector("small");
     if (hint) {
       hint.textContent =
-        "Allow microphone access (tap Start once) to see device names. Mic changes apply on Restart.";
+        "允许麦克风访问(点击一次“开始”)后可查看设备名称。麦克风更改在“重新连接”后生效。";
     }
   } else {
     const hint = inputAudioInput.parentElement?.querySelector("small");
-    if (hint) hint.textContent = "Applies on the next conversation (or Restart).";
+    if (hint) hint.textContent = "下一次对话(或点击“重新连接”)后生效。";
   }
 }
 
@@ -1296,7 +1420,7 @@ function fillDeviceSelect(select, devices, selectedId, fallbackLabel) {
   select.replaceChildren();
   const def = document.createElement("option");
   def.value = "";
-  def.textContent = "System default";
+  def.textContent = "系统默认";
   select.appendChild(def);
   devices.forEach((d, i) => {
     const opt = document.createElement("option");
@@ -1309,7 +1433,7 @@ function fillDeviceSelect(select, devices, selectedId, fallbackLabel) {
   if (prev && ![...select.options].some((o) => o.value === prev)) {
     const missing = document.createElement("option");
     missing.value = prev;
-    missing.textContent = `${fallbackLabel} (saved, not found)`;
+    missing.textContent = `${fallbackLabel}(已保存,未找到)`;
     select.appendChild(missing);
   }
   select.value = prev;
@@ -1322,16 +1446,30 @@ if (navigator.mediaDevices?.addEventListener) {
   });
 }
 
+/** getUserMedia exists only in a secure context: https://, or http://localhost.
+ *  A page opened at http://<LAN IP> has no navigator.mediaDevices at all, so the
+ *  browser's own TypeError ("undefined is not an object") is replaced with
+ *  something the user can act on. */
+function assertCaptureContext() {
+  if (navigator.mediaDevices?.getUserMedia) return;
+  throw new Error(
+    "当前地址不是安全上下文（浏览器只在 https 或 localhost 下开放麦克风）。" +
+      `请改用 https://${location.hostname}:8443/ 打开（首次需信任 Caddy 自签证书），` +
+      `或在本机执行 ssh -L 8080:127.0.0.1:8080 dgpu-nuc 后访问 http://localhost:8080/。`,
+  );
+}
+
 /** Prompt for mic permission up front, then immediately release the tracks so no
  *  recording indicator lingers during a queue wait. Throws a friendly error if the
  *  user denies. */
 async function primeMicPermission() {
+  assertCaptureContext();
   try {
     const s = await navigator.mediaDevices.getUserMedia(micConstraints());
     for (const track of s.getTracks()) track.stop();
   } catch (err) {
     throw new Error(
-      `Microphone access denied${err instanceof Error ? `: ${err.message}` : ""}`,
+      `麦克风访问被拒绝${err instanceof Error ? `:${err.message}` : ""}`,
     );
   }
 }
@@ -1339,6 +1477,7 @@ async function primeMicPermission() {
 /** Acquire the live capture stream once a slot is granted. Permission was primed
  *  in the tap gesture, so this is silent. Stored module-side for mute + teardown. */
 async function acquireMicStream() {
+  assertCaptureContext();
   micStream = await navigator.mediaDevices.getUserMedia(micConstraints());
   return micStream;
 }
@@ -1346,7 +1485,7 @@ async function acquireMicStream() {
 /** @param {number} position Update the queued caption ("You're #N in line"). */
 function onQueuePosition(position) {
   const n = Number(position) || 0;
-  setCaption(n > 0 ? `You're #${n} in line` : "Finding you a spot…", "muted");
+  setCaption(n > 0 ? `排在第 ${n} 位` : "正在为你寻找空位…", "muted");
 }
 
 // ── "Your turn" join countdown ──────────────────────────────────────────────
@@ -1359,14 +1498,14 @@ function startJoinCountdown(sec) {
   stopJoinCountdown();
   let left = Math.max(0, Math.floor(sec));
   const paint = () => {
-    joinQueueBtn.textContent = left > 0 ? `Join now (${left}s)` : "Join now";
+    joinQueueBtn.textContent = left > 0 ? `立即加入(${left} 秒)` : "立即加入";
   };
   paint();
   joinCountdownTimer = window.setInterval(() => {
     left -= 1;
     if (left <= 0) {
       stopJoinCountdown();
-      joinQueueBtn.textContent = "Join now";
+      joinQueueBtn.textContent = "立即加入";
       return;
     }
     paint();
@@ -1401,7 +1540,7 @@ async function doStart(audioContext = null) {
   chat.clear();
   chat.reset();
   setState("connecting");
-  setCaption("Asking for mic…", "muted");
+  setCaption("正在请求麦克风权限…", "muted");
 
   // Create + resume the AudioContext SYNCHRONOUSLY, still inside the gesture.
   // iOS Safari only starts an AudioContext from a user gesture; if we waited
@@ -1455,6 +1594,8 @@ async function doStart(audioContext = null) {
       });
   client = c;
   c.setMuted(micMuted || userAudioReplaying);
+  c.setStyle(stylePin);
+  c.setInterruptible(!String(ttsEngine.engine || "").startsWith("cosyvoice"));
 
   c.addEventListener("queue", (e) => {
     const { position, queueId } = /** @type {CustomEvent<{ position: number; queueId: string }>} */ (e).detail;
@@ -1501,8 +1642,14 @@ async function doStart(audioContext = null) {
   });
 
   c.addEventListener("response-finished", (e) => {
-    const detail = /** @type {CustomEvent<{ responseId: string; status: string; audible?: boolean; transcript?: string; latency?: import("./turn-latency.js").TurnLatency | null }>} */ (e).detail;
+    const detail = /** @type {CustomEvent<{ responseId: string; status: string; audible?: boolean; transcript?: string; latency?: import("./turn-latency.js").TurnLatency | null; clientTiming?: import("./client-latency.js").ClientLatencySummary | null }>} */ (e).detail;
     chat.onResponseFinished(detail);
+  });
+  c.addEventListener("response-audio-finished", (e) => {
+    // The reply's buffered audio finished playing — the caption bubble has been
+    // read out in full and may now fade.
+    const detail = /** @type {CustomEvent<{ responseId: string }>} */ (e).detail;
+    chat.onAssistantAudioFinished(detail.responseId);
   });
   c.addEventListener("error", (e) => {
     const detail = /** @type {CustomEvent<{ error: unknown }>} */ (e).detail;
@@ -1536,7 +1683,21 @@ async function doStart(audioContext = null) {
   });
 
   try {
-    await c.connect();
+    // After a disconnect (or an engine switch) the single pipeline slot is
+    // recycled for a few seconds; dialing in that window is rejected with
+    // "All N session slots are in use". Retry briefly instead of surfacing a
+    // connection error for something that clears itself.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await c.connect();
+        break;
+      } catch (err) {
+        const busy = /slot|in use|1008|busy/i.test(String(err && err.message || err));
+        if (!busy || attempt >= 8) throw err;
+        setCaption("语音管线正在回收，稍候重试…", "muted");
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
   } catch (err) {
     // The grant can be refused (402 → limit) or the dial can fail. In LB mode
     // the AudioContext hasn't been adopted by the client yet (the session POST
