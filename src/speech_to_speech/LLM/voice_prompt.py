@@ -1,6 +1,7 @@
 """Voice-channel system prompt: lead + session prompt + tail (strongest constraints last)."""
 
 from speech_to_speech.LLM.utils import format_language_instruction
+from speech_to_speech.pipeline.style import style_prompt_section
 
 VOICE_SYSTEM_PROMPT_LEAD = """\
 You are in a spoken conversation. The user speaks and hears you.
@@ -37,19 +38,27 @@ def build_voice_system_prompt(
     *,
     tool_section: str = "",
     language_name: str | None = None,
+    enable_style_tags: bool = False,
 ) -> str:
-    """Context → session prompt → optional tool block → optional language hint → voice rules."""
+    """Context → session prompt → optional tool block → optional language hint → voice rules.
+
+    ``enable_style_tags`` appends the spoken-style section. It is opt-in because
+    only some TTS backends honour styles, and the voice-rule budget is tight.
+    """
     tools = tool_section.strip()
     optional_tools = f"\n\n{tools}" if tools else ""
     optional_language = ""
     if language_name:
         optional_language = f"\n\n{format_language_instruction(language_name)}"
+    tail = VOICE_SYSTEM_PROMPT_TAIL.rstrip()
+    if enable_style_tags:
+        tail = f"{tail}\n\n{style_prompt_section()}"
     return _VOICE_SYSTEM_PROMPT_FULL.format(
         lead=VOICE_SYSTEM_PROMPT_LEAD.rstrip(),
         session_prompt=session_prompt.strip(),
         optional_tools=optional_tools,
         optional_language=optional_language,
-        tail=VOICE_SYSTEM_PROMPT_TAIL.rstrip(),
+        tail=tail,
     )
 
 

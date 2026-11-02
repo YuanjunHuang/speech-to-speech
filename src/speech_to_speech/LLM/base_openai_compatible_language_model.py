@@ -57,6 +57,7 @@ from speech_to_speech.pipeline.messages import (
     TokenUsage,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+from speech_to_speech.pipeline.style import strip_style_tags
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
 from speech_to_speech.utils.utils import audio_to_wav_base64, is_out_of_band, response_wants_audio
 
@@ -83,6 +84,20 @@ class TextDelta(BaseModel):
     text: str
 
 
+def _history_content(part: AssistantContent) -> AssistantContent:
+    """Drop spoken-style tags from an assistant content part bound for history.
+
+    Style tags steer the TTS voice; they are pipeline protocol rather than
+    something the assistant said, so history keeps only the voiced text.
+    """
+    updates = {
+        name: strip_style_tags(value)
+        for name in ("text", "transcript")
+        if isinstance(value := getattr(part, name, None), str)
+    }
+    return part.model_copy(update=updates) if updates else part
+
+
 class AssistantMessage(BaseModel):
     """A complete assistant turn to write back to history."""
 
@@ -92,7 +107,10 @@ class AssistantMessage(BaseModel):
 
     def to_chat_item(self) -> RealtimeConversationItemAssistantMessage:
         item = RealtimeConversationItemAssistantMessage(
-            type="message", role="assistant", content=self.content, id=self.id
+            type="message",
+            role="assistant",
+            content=[_history_content(part) for part in self.content],
+            id=self.id,
         )
         if self.response_item is not None:
             return ResponsesAssistantMessage(
@@ -195,7 +213,10 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         reasoning_effort: Optional[str] = None,
         request_timeout_s: float = 20.0,
         stream_batch_sentences: int = 3,
+        stream_batch_schedule: str = "",
+        stream_batch_first_min_chars: int = 0,
         enable_lang_prompt: bool = False,
+        enable_style_tags: bool = False,
         compact_history: bool = False,
         audio_max_tokens: int = 256,
         audio_temperature: float = 0.0,
@@ -208,7 +229,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self.model_name = model_name
         self.stream = stream
         self.stream_batch_sentences = max(1, stream_batch_sentences)
+        # Sentence counts for the first batches of each response (see the argument help).
+        self.stream_batch_first_min_chars = max(0, int(stream_batch_first_min_chars or 0))
+        self.stream_batch_schedule = [
+            max(1, int(part)) for part in str(stream_batch_schedule or "").replace(" ", "").split(",") if part.isdigit()
+        ]
         self.enable_lang_prompt = enable_lang_prompt
+        self.enable_style_tags = enable_style_tags
         self.gen_kwargs = dict(gen_kwargs)
         self.audio_max_tokens = audio_max_tokens
         self.audio_temperature = audio_temperature
@@ -522,7 +549,11 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         if not instructions and not language_name:
             return
         builder = build_voice_system_prompt if wants_audio else build_text_system_prompt
-        full_instructions = builder(instructions or "", language_name=language_name)
+        # Only the voice builder knows about spoken styles.
+        style_kwargs = (
+            {"enable_style_tags": getattr(self, "enable_style_tags", False)} if wants_audio else {}
+        )
+        full_instructions = builder(instructions or "", language_name=language_name, **style_kwargs)
         chat.prepend_instructions(full_instructions)
 
     # ── output helpers ──────────────────────────────────────────────────────--
@@ -599,6 +630,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         cancelled = False
         printable_text = ""
         sentence_batch: list[str] = []
+        batches_flushed = 0
+
+        def _batch_target() -> int:
+            schedule = getattr(self, "stream_batch_schedule", ())
+            if batches_flushed < len(schedule):
+                return schedule[batches_flushed]
+            return self.stream_batch_sentences
 
         def _flush(batch: list[str]) -> Iterator[LLMOut]:
             if not batch:
@@ -666,13 +704,18 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 if len(sentences) > 1:
                     for s in sentences[:-1]:
                         sentence_batch.append(remove_markdown(s))
-                        if len(sentence_batch) >= self.stream_batch_sentences:
+                        first_ok = (
+                            batches_flushed > 0
+                            or sum(len(x) for x in sentence_batch) >= getattr(self, "stream_batch_first_min_chars", 0)
+                        )
+                        if len(sentence_batch) >= _batch_target() and first_ok:
                             if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
                                 logger.info("LLM generation cancelled (stale speculative turn)")
                                 cancelled = True
                                 break
                             yield from _flush(sentence_batch)
                             sentence_batch = []
+                            batches_flushed += 1
                     if cancelled:
                         break
                     printable_text = sentences[-1] + trailing_whitespace

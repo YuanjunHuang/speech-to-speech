@@ -224,6 +224,9 @@ class TTSInput(PipelineMessage):
 
     tag: Literal["tts_input"] = "tts_input"
     text: str
+    # Spoken-style channel value (e.g. ``开心``) extracted from an inline
+    # ``[style:…]`` tag, or None for the backend's configured default voice.
+    style: str | None = None
     language_code: Optional[str] = None
     selected_language: str | None = Field(default=None, exclude=True)
     tts_language_code: str | None = Field(default=None, exclude=True)
