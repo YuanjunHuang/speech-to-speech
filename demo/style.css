@@ -18,8 +18,10 @@
 
   /* Mono is the "machine voice": reserved for system text the app emits —
    * the orb's status caption, tool calls, the transport tag. Body/UI stays
-   * Inter. */
+   * Inter (CJK text falls back to Noto Sans SC so Chinese renders with the
+   * correct weight/metrics instead of the OS default sans). */
   --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  --font-sans: "Inter", "Noto Sans SC", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 
   /* Thesis: color belongs to the voice. The chrome is monochrome; saturated
    * hue appears only on the orb and on these tiny role echoes, which mirror
@@ -61,7 +63,7 @@ body {
 }
 
 body {
-  font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-family: "Inter", "Noto Sans SC", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   background: radial-gradient(ellipse at 50% 20%, #1a1c28 0%, var(--bg) 60%);
   color: var(--text);
   min-height: 100vh;
@@ -84,8 +86,14 @@ a:hover {
 
 #app {
   display: grid;
-  grid-template-rows: auto 1fr auto;
-  min-height: 100vh;
+  /* A definite height makes the middle `1fr` row resolve against the viewport
+   * instead of its content: with only min-height, an auto-height grid sizes
+   * `1fr` rows to their max-content, so the tall left rail would stretch the
+   * app past the viewport and push the orb off-centre. minmax(0, 1fr) then
+   * lets the row shrink and the rail scroll internally. */
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: 100vh;
+  height: 100dvh;
 }
 
 .hidden {
@@ -164,11 +172,12 @@ a:hover {
   .about-btn-mobile {
     display: inline-flex;
   }
-  /* Keep phone icons at the current compact size — the desktop bump above
-   * shouldn't leak into the mobile topbar. */
+  /* Phones keep the same 40px target as the base .icon-btn — the desktop
+   * bump to 44px above is reset here, but we don't go below the 40px floor
+   * (WCAG/Android touch-target guidance) on the smallest screens. */
   .topbar-right .icon-btn {
-    width: 36px;
-    height: 36px;
+    width: 40px;
+    height: 40px;
   }
   .topbar-right .icon-btn svg {
     width: 18px;
@@ -311,8 +320,8 @@ a:hover {
   background: var(--bg-elev);
   border: 1px solid var(--border);
   color: var(--text-dim);
-  width: 36px;
-  height: 36px;
+  width: 40px;
+  height: 40px;
   border-radius: var(--radius-sm);
   display: inline-flex;
   align-items: center;
@@ -321,16 +330,21 @@ a:hover {
   touch-action: manipulation;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
+.icon-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .icon-btn:hover {
   background: var(--bg-elev-2);
   color: var(--text);
   border-color: var(--border-strong);
 }
-/* Topbar control cluster reads a touch bigger on desktop. Phones keep the
- * compact 36px (reset in the mobile media query). */
+/* Topbar control cluster reads a touch bigger on desktop; both tiers clear
+ * the 44px minimum touch-target guidance. Phones keep the compact 40px
+ * (reset in the mobile media query). */
 .topbar-right .icon-btn {
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
 }
 .topbar-right .icon-btn svg {
   width: 20px;
@@ -1348,6 +1362,350 @@ body.cam-on .footer {
   justify-content: flex-end;
 }
 
+/* ─── System info rail (left) ─────────────────────────────────────────── *
+ * Deployment metadata for the machine that runs the backend: the hardware
+ * inventory (CPU / GPU / NPU) and which accelerator each pipeline stage uses.
+ * The values live in ui/system-info.js — a browser can't read the backend's
+ * hardware. Wide viewports: a static left column the topbar can fold away.
+ * Narrow viewports: a slide-in drawer over a backdrop.
+ *
+ * The rail is deliberately airy: hairline-separated rows instead of nested
+ * cards, a light type scale, and no fill (it reads as part of the canvas).
+ * Only the small device tags/badges carry colour. */
+.system-info {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+}
+
+.sysinfo-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 22px 28px 4px;
+}
+.sysinfo-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--text-dim);
+}
+.sysinfo-close {
+  display: none;
+  width: 30px;
+  height: 30px;
+}
+
+.sysinfo-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px 28px 18px;
+  scrollbar-width: thin;
+}
+.sysinfo-body::-webkit-scrollbar { width: 4px; }
+.sysinfo-body::-webkit-scrollbar-track { background: transparent; }
+.sysinfo-body::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+
+.sysinfo-host {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sysinfo-host-name {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text);
+}
+.sysinfo-host-meta {
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.sysinfo-section { margin-top: 24px; }
+.sysinfo-section-title {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+}
+
+.sysinfo-devices,
+.sysinfo-modules,
+.sysinfo-notes {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* One hairline per row keeps the list scannable without stacking boxes. */
+.sysinfo-device,
+.sysinfo-module {
+  border-top: 1px solid var(--border);
+}
+
+.sysinfo-device {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 0 13px;
+}
+/* Tag + purpose share the top line: the chip anchors the row, and the short
+ * purpose ("STT · LLM") reads as the reverse of the pipeline map below. */
+.sysinfo-device-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 5px;
+}
+.sysinfo-device-tag {
+  padding: 1px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+.sysinfo-device-name {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: var(--text);
+}
+.sysinfo-device-spec {
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.sysinfo-device-note {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+/* Device accents reuse the orb's colour language: amber = CPU, cyan = the
+ * Arc GPU. No new hues enter the chrome. */
+.sysinfo-device[data-device="cpu"] .sysinfo-device-tag {
+  color: var(--processing);
+  border-color: rgba(245, 158, 11, 0.42);
+}
+.sysinfo-device[data-device="gpu1"] .sysinfo-device-tag {
+  color: var(--accent-2);
+  border-color: rgba(34, 211, 238, 0.42);
+}
+
+.sysinfo-module {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+}
+.sysinfo-module-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sysinfo-stage {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+.sysinfo-module-name {
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.45;
+  color: var(--text);
+}
+.sysinfo-module-job {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+}
+
+.sysinfo-badge {
+  padding: 3px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  color: var(--text-dim);
+}
+.sysinfo-badge[data-device="gpu1"] {
+  color: var(--accent-2);
+  border-color: rgba(34, 211, 238, 0.35);
+  background: rgba(34, 211, 238, 0.08);
+}
+.sysinfo-badge[data-device="cpu"] {
+  color: var(--processing);
+  border-color: rgba(245, 158, 11, 0.35);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.sysinfo-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.sysinfo-notes li {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+.sysinfo-backdrop { display: none; }
+
+/* ─── Voice style picker (rail footer) ────────────────────────────────── *
+ * Pins the spoken emotion for the replies that follow. A radio group rather
+ * than a <select> so all five options stay visible — it doubles as the
+ * vocabulary the backend understands. "自动" hands the choice back to the
+ * model's inline tags. */
+.style-picker-slot {
+  flex: none;
+  border-top: 1px solid var(--border);
+  padding: 14px 28px 20px;
+}
+
+.style-picker {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.style-picker-legend {
+  padding: 0;
+  margin-bottom: 9px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+}
+.style-picker-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.style-chip {
+  cursor: pointer;
+}
+/* Keep the native radio in the DOM for keyboard and AT, but paint the chip
+ * instead: the row then reads as one control strip rather than six fields. */
+.style-chip input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.style-chip span {
+  display: inline-block;
+  padding: 4px 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text-dim);
+  transition:
+    color 0.15s,
+    border-color 0.15s,
+    background 0.15s;
+}
+.style-chip:hover span {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+/* Violet is the assistant's voice colour, so the pinned chip echoes the orb. */
+.style-chip input:checked + span {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.style-chip input:focus-visible + span {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 2px;
+}
+.style-picker-hint {
+  margin: 10px 0 0;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-faint);
+}
+
+/* Wide: fold the rail into the app grid as a real column. */
+@media (min-width: 1080px) {
+  #app {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas:
+      "topbar topbar"
+      "rail stage"
+      "footer footer";
+  }
+  .topbar { grid-area: topbar; }
+  .stage { grid-area: stage; }
+  .footer { grid-area: footer; }
+  .system-info { grid-area: rail; width: 360px; }
+  body.device-collapsed .system-info { display: none; }
+  /* Keep the webcam self-view clear of the rail. */
+  body:not(.device-collapsed) .cam-pip { left: 384px; }
+}
+
+/* Narrow: the rail becomes a left drawer over a backdrop. */
+@media (max-width: 1079px) {
+  .system-info {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    z-index: 190;
+    width: min(360px, 90vw);
+    background: var(--bg-elev);
+    border-right: 1px solid var(--border);
+    box-shadow: 8px 0 32px rgba(0, 0, 0, 0.4);
+    transform: translateX(-100%);
+    transition: transform 0.28s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  body.device-open .system-info { transform: translateX(0); }
+  .sysinfo-header { padding: 22px 24px 4px; }
+  .sysinfo-body { padding: 8px 24px 18px; }
+  .style-picker-slot { padding: 14px 24px 20px; }
+  .sysinfo-close { display: inline-flex; }
+  .sysinfo-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 180;
+    background: rgba(8, 9, 13, 0.45);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease;
+  }
+  body.device-open .sysinfo-backdrop { opacity: 1; pointer-events: auto; }
+}
+
 /* ─── Modal ───────────────────────────────────────────────────────────── */
 
 .modal {
@@ -1437,6 +1795,16 @@ body.cam-on .footer {
   line-height: 1.4;
 }
 .field small.error { color: var(--error); }
+.field small.engine-status {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+.field small.engine-status[data-kind="busy"] { color: var(--processing); }
+.field small.engine-status[data-kind="ok"] { color: var(--success); }
+.field small.engine-status[data-kind="error"] { color: var(--error); }
 .field small code {
   background: var(--bg);
   padding: 1px 5px;
@@ -2752,3 +3120,36 @@ body.cam-on .footer {
 }
 .hist-timings p { margin: 8px 0; line-height: 1.5; }
 .hist-timings .timing-status { color: var(--text); }
+
+/* Browser-measured section: what the user actually heard, not just the server. */
+.hist-timings .timing-client {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.hist-timings .timing-sentences {
+  margin: 8px 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 6px;
+  list-style: decimal;
+}
+.hist-timings .timing-sentences li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  align-items: baseline;
+}
+.hist-timings .timing-sentence-text {
+  overflow-wrap: anywhere;
+  color: var(--text-dim);
+}
+.hist-timings .timing-sentence-value {
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+@media (max-width: 520px) {
+  .hist-timings .timing-sentences li { grid-template-columns: minmax(0, 1fr); }
+  .hist-timings .timing-sentence-value { white-space: normal; }
+}
