@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="style.css?v=engine-v1" />
+    <link rel="stylesheet" href="style.css?v=sysinfo-dyn1" />
   </head>
   <!--
     `booting` disables transitions/animations until the first paint commits.
@@ -324,6 +324,15 @@
               <small>Lowers the assistant's volume when you start speaking. Applies on the next conversation.</small>
             </label>
 
+            <label class="field">
+              <span>设备占用面板</span>
+              <select id="sys-monitor">
+                <option value="on">显示</option>
+                <option value="off">隐藏</option>
+              </select>
+              <small>在页面顶部中间显示运行 S2S 的设备 CPU / GPU / 内存实时占用。</small>
+            </label>
+
             <label class="field" id="playback-buffer-field">
               <span>播放启动缓冲(毫秒)</span>
               <input id="playback-buffer-ms" type="number" min="0" step="any" aria-describedby="playback-buffer-hint" />
@@ -447,6 +456,6 @@
     </dialog>
 
     <script src="vendor/openai-realtime-agents.umd.js"></script>
-    <script type="module" src="main.js?v=audio-24k-v5"></script>
+    <script type="module" src="main.js?v=audio-24k-v5-dyn1"></script>
   </body>
 </html>

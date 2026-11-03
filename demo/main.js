@@ -21,7 +21,8 @@ import { S2sRealtimeClient, normalizePlaybackBufferMs } from "./s2s-realtime-cli
 import { $, truncateError, errorMessage, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js?v=bubble-hold-v1";
 import { Account } from "./ui/account.js";
-import { initSystemInfo, setStageModule, setTtsModule } from "./ui/system-info.js?v=sysinfo-v9";
+import { initSystemInfo, setStageModule, setTtsModule, getAccelBadge, whenHostInfoLoaded } from "./ui/system-info.js?v=sysinfo-v10";
+import { initSysMonitor } from "./ui/sys-monitor.js?v=sysmon-v2";
 import { initStylePicker } from "./ui/style-picker.js?v=style-v3";
 import { createTtsEnginePicker } from "./tts-engine.js?v=engine-v2";
 
@@ -474,6 +475,9 @@ const TTS_PANEL = {
   cosyvoice3: { name: "CosyVoice3 · 0.5B", job: "语音合成 · 逐句", detail: "LLM·CPU · flow/HiFT·A770", device: "gpu1" },
 };
 
+/** "CPU" stays on the CPU row; any GPU.* name means the accelerator row. */
+const deviceKey = (/** @type {string} */ d) => (/^cpu$/i.test(d) ? "cpu" : "gpu1");
+
 const ttsEngine = createTtsEnginePicker({
   select: /** @type {HTMLSelectElement} */ ($("#tts-engine")),
   hint: /** @type {HTMLElement} */ ($("#tts-engine-hint")),
@@ -484,14 +488,27 @@ const ttsEngine = createTtsEnginePicker({
   },
   onActive: (engine, state) => {
     const info = TTS_PANEL[engine];
-    if (info) setTtsModule(info);
-    const stt = state?.stt && STT_PANEL[state.stt.id];
-    if (stt) setStageModule("STT", stt);
+    if (info) {
+      setTtsModule({
+        ...info,
+        detail: info.detail.replace("flow/HiFT·A770", `flow/HiFT·${getAccelBadge()}`),
+      });
+    }
+    const sttPanel = state?.stt && STT_PANEL[state.stt.id];
+    if (sttPanel) {
+      const dev = state.stt.device;
+      setStageModule("STT", dev ? { ...sttPanel, device: deviceKey(dev) } : sttPanel);
+    }
     const llmId = state?.llm?.id;
-    if (llmId) setStageModule("LLM", { name: LLM_PANEL[llmId] || llmId });
+    if (llmId) {
+      const dev = state.llm.device;
+      setStageModule("LLM", { name: LLM_PANEL[llmId] || llmId, ...(dev ? { device: deviceKey(dev) } : {}) });
+    }
   },
 });
 void ttsEngine.refresh();
+void whenHostInfoLoaded().then(() => ttsEngine.refresh());
+initSysMonitor({ select: /** @type {HTMLSelectElement} */ ($("#sys-monitor")) });
 let limiterOn = false;
 let heartbeatTimer = 0;
 let trackedSessionId = "";
