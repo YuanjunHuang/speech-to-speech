@@ -35,3 +35,11 @@ def test_explicit_tool_choice_and_missing_tool_respected():
 def test_list_content_parts():
     msgs = [{"role": "user", "content": [{"type": "text", "text": "今天会下雨吗"}]}]
     assert force_tool_for_intent(msgs, {"tools": [WX]})["tool_choice"] == "required"
+
+
+def test_search_intent_forces_web_search_but_not_small_talk():
+    ws = {"type": "function", "function": {"name": "web_search"}}
+    assert force_tool_for_intent(user("今天有什么新闻"), {"tools": [ws]})["tool_choice"] == "required"
+    assert force_tool_for_intent(user("查一下特斯拉股价"), {"tools": [ws]})["tools"] == [ws]
+    kw = {"tools": [ws]}
+    assert force_tool_for_intent(user("你好呀"), kw) is kw

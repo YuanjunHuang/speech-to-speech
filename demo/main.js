@@ -778,7 +778,7 @@ function syncToolsUi() {
     searchKeyInput.value = "";
     searchKeyInput.placeholder = "••••••••  · 由服务器提供";
     searchKeyInput.disabled = true;
-    toolWebHint.textContent = "已就绪。搜索密钥保存在服务器端,不会发送到你的浏览器。";
+    toolWebHint.textContent = "已就绪。搜索由服务器端完成(未配置密钥时使用 Bing 免费搜索)。";
   } else {
     searchKeyInput.disabled = false;
     searchKeyInput.value = userSearchKey;
@@ -1062,7 +1062,7 @@ async function execWebSearch(query) {
   // rather than its (older) training knowledge.
   const today = new Date().toISOString().slice(0, 10);
   /** @type {string[]} */
-  const lines = [`Google 搜索结果,日期 ${today}:`];
+  const lines = [`网络搜索结果,日期 ${today}:`];
   if (json.answer) lines.push(`答案:${json.answer}`);
   for (const r of json.results || []) {
     lines.push(`- ${r.title}:${r.snippet}(${r.url})`);
