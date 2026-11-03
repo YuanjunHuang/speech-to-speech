@@ -85,6 +85,21 @@ const TOOL_DEFS = {
       required: ["query"],
     },
   },
+  get_weather: {
+    type: "function",
+    name: "get_weather",
+    description:
+      "Get the real-time weather and a short forecast for a city. Always use this for any " +
+      "weather question instead of answering from memory. City may be in Chinese or English.",
+    parameters: {
+      type: "object",
+      properties: {
+        city: { type: "string", description: "City name, e.g. 北京 or Shanghai." },
+        days: { type: "integer", description: "Forecast days (1-7). Default 3." },
+      },
+      required: ["city"],
+    },
+  },
   camera_snapshot: {
     type: "function",
     name: "camera_snapshot",
@@ -156,7 +171,7 @@ function saveSettings(s) {
   localStorage.setItem(STORAGE_KEYS.audioOutputId, s.audioOutputId || "");
 }
 
-/** @returns {{ web_search: boolean, camera_snapshot: boolean }} */
+/** @returns {{ web_search: boolean, get_weather: boolean, camera_snapshot: boolean }} */
 function loadTools() {
   try {
     const raw = JSON.parse(localStorage.getItem(STORAGE_KEYS.tools) || "{}");
@@ -167,10 +182,11 @@ function loadTools() {
     // The user can still switch it on from the Tools panel.
     return {
       web_search: raw.web_search ?? true,
+      get_weather: raw.get_weather ?? true,
       camera_snapshot: raw.camera_snapshot ?? false,
     };
   } catch {
-    return { web_search: true, camera_snapshot: false };
+    return { web_search: true, get_weather: true, camera_snapshot: false };
   }
 }
 
@@ -248,6 +264,7 @@ const toolsClose = $("#tools-close");
 const toolWebSwitch = $("#tool-web");
 /** @type {HTMLInputElement} */
 const toolCamSwitch = $("#tool-cam");
+const toolWeatherSwitch = $("#tool-weather");
 /** @type {HTMLElement} */
 const toolWebRow = $("#tool-web-row");
 /** @type {HTMLElement} */
@@ -402,6 +419,7 @@ function searchAvailable() {
 function activeToolDefs() {
   const defs = [];
   if (toolsEnabled.web_search && searchAvailable()) defs.push(TOOL_DEFS.web_search);
+  if (toolsEnabled.get_weather) defs.push(TOOL_DEFS.get_weather);
   if (toolsEnabled.camera_snapshot) defs.push(TOOL_DEFS.camera_snapshot);
   return defs;
 }
@@ -753,6 +771,7 @@ function syncToolsUi() {
   toolWebSwitch.disabled = !avail;
   toolWebRow.classList.toggle("disabled", !avail);
   toolCamSwitch.checked = toolsEnabled.camera_snapshot;
+  toolWeatherSwitch.checked = toolsEnabled.get_weather;
 
   if (serverSearchKey) {
     // Key lives server-side: show it as configured, never expose it.
@@ -782,6 +801,12 @@ toolWebSwitch.addEventListener("change", () => {
     return;
   }
   toolsEnabled.web_search = toolWebSwitch.checked;
+  saveTools();
+  pushToolsToSession();
+});
+
+toolWeatherSwitch.addEventListener("change", () => {
+  toolsEnabled.get_weather = toolWeatherSwitch.checked;
   saveTools();
   pushToolsToSession();
 });
@@ -976,6 +1001,8 @@ async function runTool(name, argsJson, callId) {
     if (name === "web_search") {
       const query = typeof args.query === "string" ? args.query : "";
       result.output = await execWebSearch(query);
+    } else if (name === "get_weather") {
+      result.output = await execWeather(typeof args.city === "string" ? args.city : "", Number(args.days) || 3);
     } else if (name === "camera_snapshot") {
       const dataUrl = captureSnapshot();
       if (dataUrl) {
@@ -994,6 +1021,20 @@ async function runTool(name, argsJson, callId) {
     result.output = `工具执行失败:${msg}`;
   }
   return result;
+}
+
+/** @param {string} city @param {number} days @returns {Promise<string>} */
+async function execWeather(city, days) {
+  if (!city) return "未提供城市。";
+  const res = await fetch(`api/weather?city=${encodeURIComponent(city)}&days=${days}`);
+  if (res.status === 404) return `没有找到城市"${city}"。`;
+  if (!res.ok) throw new Error(`天气查询出错(${res.status})`);
+  const w = await res.json();
+  const c = w.current;
+  const lines = [`实时天气(Open-Meteo),${w.place},当地时间 ${w.time}:`,
+    `现在:${c.weather},${c.temp}°C(体感 ${c.feels_like}°C),湿度 ${c.humidity}%,风速 ${c.wind_kmh} km/h。`];
+  for (const d of w.forecast) lines.push(`${d.date}:${d.weather},${d.min}~${d.max}°C,降水概率 ${d.rain_prob}%`);
+  return lines.join("\n");
 }
 
 /** @param {string} query @returns {Promise<string>} */

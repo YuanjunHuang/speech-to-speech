@@ -283,6 +283,53 @@ async def me(request: Request):
     return resp
 
 
+WEATHER_CODES = {
+    0: "晴", 1: "大部晴朗", 2: "多云", 3: "阴", 45: "雾", 48: "雾凇", 51: "小毛毛雨", 53: "毛毛雨", 55: "大毛毛雨",
+    61: "小雨", 63: "中雨", 65: "大雨", 66: "冻雨", 67: "强冻雨", 71: "小雪", 73: "中雪", 75: "大雪", 77: "米雪",
+    80: "小阵雨", 81: "阵雨", 82: "强阵雨", 85: "小阵雪", 86: "大阵雪", 95: "雷暴", 96: "雷暴伴冰雹", 99: "强雷暴伴冰雹",
+}
+
+
+@app.get("/api/weather")
+async def weather(city: str = "", days: int = 3):
+    """Live weather via Open-Meteo (no key). Returns current conditions and a short forecast."""
+    city = city.strip()
+    if not city:
+        raise HTTPException(status_code=400, detail="Empty city.")
+    days = max(1, min(int(days), 7))
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            geo = (await http.get("https://geocoding-api.open-meteo.com/v1/search",
+                                  params={"name": city, "count": 1, "language": "zh"})).json()
+            places = geo.get("results") or []
+            if not places:
+                raise HTTPException(status_code=404, detail=f"City not found: {city}")
+            p = places[0]
+            data = (await http.get("https://api.open-meteo.com/v1/forecast", params={
+                "latitude": p["latitude"], "longitude": p["longitude"], "timezone": "auto", "forecast_days": days,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            })).json()
+    except httpx.RequestError as exc:
+        logger.warning("Open-Meteo unreachable: %r", exc)
+        raise HTTPException(status_code=502, detail="Weather provider unreachable.")
+    cur, daily = data.get("current") or {}, data.get("daily") or {}
+    forecast = [
+        {"date": d, "weather": WEATHER_CODES.get(daily["weather_code"][i], "未知"),
+         "max": daily["temperature_2m_max"][i], "min": daily["temperature_2m_min"][i],
+         "rain_prob": daily["precipitation_probability_max"][i]}
+        for i, d in enumerate(daily.get("time", []))
+    ]
+    return JSONResponse({
+        "place": ", ".join(x for x in (p.get("name"), p.get("admin1"), p.get("country")) if x),
+        "time": cur.get("time"),
+        "current": {"weather": WEATHER_CODES.get(cur.get("weather_code"), "未知"), "temp": cur.get("temperature_2m"),
+                    "feels_like": cur.get("apparent_temperature"), "humidity": cur.get("relative_humidity_2m"),
+                    "wind_kmh": cur.get("wind_speed_10m")},
+        "forecast": forecast,
+    })
+
+
 @app.post("/api/search")
 async def search(req: SearchRequest, request: Request):
     """Proxy a Google search via Serper.dev. The key stays on the server unless
