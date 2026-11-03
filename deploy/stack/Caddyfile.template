@@ -1,0 +1,31 @@
+{
+	auto_https disable_redirects
+}
+
+# One site per scheme; both serve the same stack. https is required for the microphone
+# on any non-localhost address. __IP__ is filled in by deploy/setup_host.sh.
+(stack) {
+	@api path /api/*
+	handle @api {
+		reverse_proxy 127.0.0.1:7860
+	}
+	handle /sys-stats* {
+		reverse_proxy 127.0.0.1:8793
+	}
+	handle /tts-admin/* {
+		reverse_proxy 127.0.0.1:8790
+	}
+	handle /v1/realtime* {
+		reverse_proxy 127.0.0.1:8765
+	}
+	root * ./www
+	file_server browse
+}
+
+:8080 {
+	import stack
+}
+
+https://__IP__:8443 {
+	import stack
+}

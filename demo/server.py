@@ -199,7 +199,10 @@ AUTH_ENABLED = LIMITER_ENABLED and auth.attach(app)
 # The Serper key is paid for. A Space is public, so there the key is only spent
 # for signed-in HF users (see _search_gate), which needs sign-in to be wired.
 # Off a Space (local dev) there's no one to protect it from.
-SERVER_SEARCH = bool(SERPER_KEY) and (AUTH_ENABLED or not SPACE_ID)
+# Keyless fallback (Bing HTML) so self-hosted deploys get web search without a Serper key.
+# Off on a Space (where the Serper gate/limits apply); FREE_SEARCH=0 disables it.
+FREE_SEARCH = os.environ.get("FREE_SEARCH", "1") != "0" and not SPACE_ID
+SERVER_SEARCH = (bool(SERPER_KEY) and (AUTH_ENABLED or not SPACE_ID)) or (FREE_SEARCH and not SERPER_KEY)
 if SERPER_KEY and not SERVER_SEARCH:
     logger.warning(
         "SERPER_API_KEY is set but this Space has no HF sign-in (needs "
@@ -283,6 +286,86 @@ async def me(request: Request):
     return resp
 
 
+WEATHER_CODES = {
+    0: "晴", 1: "大部晴朗", 2: "多云", 3: "阴", 45: "雾", 48: "雾凇", 51: "小毛毛雨", 53: "毛毛雨", 55: "大毛毛雨",
+    61: "小雨", 63: "中雨", 65: "大雨", 66: "冻雨", 67: "强冻雨", 71: "小雪", 73: "中雪", 75: "大雪", 77: "米雪",
+    80: "小阵雨", 81: "阵雨", 82: "强阵雨", 85: "小阵雪", 86: "大阵雪", 95: "雷暴", 96: "雷暴伴冰雹", 99: "强雷暴伴冰雹",
+}
+
+
+@app.get("/api/weather")
+async def weather(city: str = "", days: int = 3):
+    """Live weather via Open-Meteo (no key). Returns current conditions and a short forecast."""
+    city = city.strip()
+    if not city:
+        raise HTTPException(status_code=400, detail="Empty city.")
+    days = max(1, min(int(days), 7))
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            geo = (await http.get("https://geocoding-api.open-meteo.com/v1/search",
+                                  params={"name": city, "count": 1, "language": "zh"})).json()
+            places = geo.get("results") or []
+            if not places:
+                raise HTTPException(status_code=404, detail=f"City not found: {city}")
+            p = places[0]
+            data = (await http.get("https://api.open-meteo.com/v1/forecast", params={
+                "latitude": p["latitude"], "longitude": p["longitude"], "timezone": "auto", "forecast_days": days,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            })).json()
+    except httpx.RequestError as exc:
+        logger.warning("Open-Meteo unreachable: %r", exc)
+        raise HTTPException(status_code=502, detail="Weather provider unreachable.")
+    cur, daily = data.get("current") or {}, data.get("daily") or {}
+    forecast = [
+        {"date": d, "weather": WEATHER_CODES.get(daily["weather_code"][i], "未知"),
+         "max": daily["temperature_2m_max"][i], "min": daily["temperature_2m_min"][i],
+         "rain_prob": daily["precipitation_probability_max"][i]}
+        for i, d in enumerate(daily.get("time", []))
+    ]
+    return JSONResponse({
+        "place": ", ".join(x for x in (p.get("name"), p.get("admin1"), p.get("country")) if x),
+        "time": cur.get("time"),
+        "current": {"weather": WEATHER_CODES.get(cur.get("weather_code"), "未知"), "temp": cur.get("temperature_2m"),
+                    "feels_like": cur.get("apparent_temperature"), "humidity": cur.get("relative_humidity_2m"),
+                    "wind_kmh": cur.get("wind_speed_10m")},
+        "forecast": forecast,
+    })
+
+
+async def _bing_search(query: str) -> dict:
+    """Keyless web search by reading Bing's result page (cn.bing.com on the Intel network)."""
+    import html as _html
+    import re as _re
+
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+               "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5"}
+    try:
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as http:
+            resp = await http.get("https://www.bing.com/search", params={"q": query, "setlang": "zh-CN", "cc": "CN"},
+                                  headers=headers)
+    except httpx.RequestError as exc:
+        logger.warning("Bing unreachable: %r", exc)
+        raise HTTPException(status_code=502, detail="Search provider unreachable.")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Search provider error ({resp.status_code})")
+
+    def clean(fragment: str) -> str:
+        return _html.unescape(_re.sub(r"\s+", " ", _re.sub(r"<[^>]+>", "", fragment))).strip()
+
+    results = []
+    for block in _re.findall(r'<li class="b_algo".*?</li>', resp.text, _re.S):
+        link = _re.search(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, _re.S)
+        if not link:
+            continue
+        snippet = _re.search(r"<p[^>]*>(.*?)</p>", block, _re.S)
+        results.append({"title": clean(link.group(2)), "snippet": clean(snippet.group(1)) if snippet else "",
+                        "url": _html.unescape(link.group(1))})
+        if len(results) >= MAX_RESULTS:
+            break
+    return {"query": query, "answer": None, "results": results}
+
+
 @app.post("/api/search")
 async def search(req: SearchRequest, request: Request):
     """Proxy a Google search via Serper.dev. The key stays on the server unless
@@ -293,6 +376,8 @@ async def search(req: SearchRequest, request: Request):
         raise HTTPException(status_code=400, detail="Empty query.")
 
     key = (req.key or "").strip()
+    if not key and FREE_SEARCH and not SERPER_KEY:
+        return JSONResponse(await _bing_search(query))
     if not key:
         if not SERVER_SEARCH:
             # No usable server key and the user didn't supply one.
