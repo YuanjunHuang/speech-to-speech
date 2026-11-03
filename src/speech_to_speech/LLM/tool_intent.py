@@ -17,6 +17,12 @@ INTENT_PATTERNS: dict[str, re.Pattern[str]] = {
         r"\b(?:weather|forecast|temperature)\b",
         re.IGNORECASE,
     ),
+    "web_search": re.compile(
+        r"新闻|最新|今天.{0,6}(?:发生|消息|热点)|热搜|股价|股票|汇率|油价|比分|赛况|"
+        r"搜索|搜一下|查一下|查查|上网|联网|百度|必应|"
+        r"\b(?:news|latest|search|price)\b",
+        re.IGNORECASE,
+    ),
 }
 
 

@@ -199,7 +199,10 @@ AUTH_ENABLED = LIMITER_ENABLED and auth.attach(app)
 # The Serper key is paid for. A Space is public, so there the key is only spent
 # for signed-in HF users (see _search_gate), which needs sign-in to be wired.
 # Off a Space (local dev) there's no one to protect it from.
-SERVER_SEARCH = bool(SERPER_KEY) and (AUTH_ENABLED or not SPACE_ID)
+# Keyless fallback (Bing HTML) so self-hosted deploys get web search without a Serper key.
+# Off on a Space (where the Serper gate/limits apply); FREE_SEARCH=0 disables it.
+FREE_SEARCH = os.environ.get("FREE_SEARCH", "1") != "0" and not SPACE_ID
+SERVER_SEARCH = (bool(SERPER_KEY) and (AUTH_ENABLED or not SPACE_ID)) or (FREE_SEARCH and not SERPER_KEY)
 if SERPER_KEY and not SERVER_SEARCH:
     logger.warning(
         "SERPER_API_KEY is set but this Space has no HF sign-in (needs "
@@ -330,6 +333,39 @@ async def weather(city: str = "", days: int = 3):
     })
 
 
+async def _bing_search(query: str) -> dict:
+    """Keyless web search by reading Bing's result page (cn.bing.com on the Intel network)."""
+    import html as _html
+    import re as _re
+
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+               "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.5"}
+    try:
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as http:
+            resp = await http.get("https://www.bing.com/search", params={"q": query, "setlang": "zh-CN", "cc": "CN"},
+                                  headers=headers)
+    except httpx.RequestError as exc:
+        logger.warning("Bing unreachable: %r", exc)
+        raise HTTPException(status_code=502, detail="Search provider unreachable.")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Search provider error ({resp.status_code})")
+
+    def clean(fragment: str) -> str:
+        return _html.unescape(_re.sub(r"\s+", " ", _re.sub(r"<[^>]+>", "", fragment))).strip()
+
+    results = []
+    for block in _re.findall(r'<li class="b_algo".*?</li>', resp.text, _re.S):
+        link = _re.search(r'<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, _re.S)
+        if not link:
+            continue
+        snippet = _re.search(r"<p[^>]*>(.*?)</p>", block, _re.S)
+        results.append({"title": clean(link.group(2)), "snippet": clean(snippet.group(1)) if snippet else "",
+                        "url": _html.unescape(link.group(1))})
+        if len(results) >= MAX_RESULTS:
+            break
+    return {"query": query, "answer": None, "results": results}
+
+
 @app.post("/api/search")
 async def search(req: SearchRequest, request: Request):
     """Proxy a Google search via Serper.dev. The key stays on the server unless
@@ -340,6 +376,8 @@ async def search(req: SearchRequest, request: Request):
         raise HTTPException(status_code=400, detail="Empty query.")
 
     key = (req.key or "").strip()
+    if not key and FREE_SEARCH and not SERPER_KEY:
+        return JSONResponse(await _bing_search(query))
     if not key:
         if not SERVER_SEARCH:
             # No usable server key and the user didn't supply one.
