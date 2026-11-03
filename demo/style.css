@@ -1504,6 +1504,7 @@ body.cam-on .footer {
   color: var(--processing);
   border-color: rgba(245, 158, 11, 0.42);
 }
+.sysinfo-device[data-device="gpu0"] .sysinfo-device-tag,
 .sysinfo-device[data-device="gpu1"] .sysinfo-device-tag {
   color: var(--accent-2);
   border-color: rgba(34, 211, 238, 0.42);
@@ -1552,6 +1553,7 @@ body.cam-on .footer {
   white-space: nowrap;
   color: var(--text-dim);
 }
+.sysinfo-badge[data-device="gpu0"],
 .sysinfo-badge[data-device="gpu1"] {
   color: var(--accent-2);
   border-color: rgba(34, 211, 238, 0.35);
@@ -3153,3 +3155,37 @@ body.cam-on .footer {
   .hist-timings .timing-sentences li { grid-template-columns: minmax(0, 1fr); }
   .hist-timings .timing-sentence-value { white-space: normal; }
 }
+
+/* Floating host-utilisation overlay (ui/sys-monitor.js) */
+.sys-monitor {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  gap: 14px;
+  padding: 8px 34px 8px 12px;
+  background: rgba(19, 21, 28, 0.82);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-soft);
+  backdrop-filter: blur(10px);
+  font-family: var(--font-mono);
+  pointer-events: auto;
+}
+.sys-monitor[hidden] { display: none; }
+.sys-monitor .sm-row { width: 120px; }
+.sys-monitor .sm-head { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); }
+.sys-monitor .sm-val { color: var(--text); font-weight: 600; }
+.sys-monitor svg { display: block; width: 120px; height: 34px; margin-top: 2px; background: rgba(255, 255, 255, 0.03); border-radius: 4px; }
+.sys-monitor .sm-sub { min-height: 12px; font-size: 10px; color: var(--text-faint); margin-top: 2px; }
+.sys-monitor .sm-close {
+  position: absolute; top: 4px; right: 6px; width: 22px; height: 22px;
+  border: 0; border-radius: 50%; background: transparent; color: var(--text-dim);
+  font-size: 16px; line-height: 20px; cursor: pointer;
+}
+.sys-monitor .sm-close:hover { background: rgba(255, 255, 255, 0.1); color: var(--text); }
+@media (max-width: 560px) { .sys-monitor { gap: 8px; padding-left: 8px; } .sys-monitor .sm-row, .sys-monitor svg { width: 84px; } }
+.sys-monitor { cursor: grab; touch-action: none; user-select: none; }
+.sys-monitor.dragging { cursor: grabbing; }

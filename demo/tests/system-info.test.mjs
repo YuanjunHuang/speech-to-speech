@@ -5,7 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { SYSTEM_INFO, buildSystemInfoHTML } from "../ui/system-info.js";
+import { SYSTEM_INFO, buildSystemInfoHTML, deriveSystemInfo } from "../ui/system-info.js";
 
 test("every pipeline module maps to a declared device", () => {
   const keys = new Set(SYSTEM_INFO.devices.map((d) => d.key));
@@ -54,4 +54,36 @@ test("builder escapes untrusted model/host strings", () => {
   assert.ok(html.includes("m &lt;x&gt;"));
   assert.ok(html.includes("s &lt;b&gt;"));
   assert.ok(html.includes("a &lt; b &amp; c"));
+});
+
+test("deriveSystemInfo: iGPU-only host makes the iGPU the accelerator", () => {
+  const { info, accel } = deriveSystemInfo({
+    host: { name: "Mind", meta: ["x"] },
+    cpu: { name: "i5-1340P", spec: ["16 线程"] },
+    gpus: [{ tag: "GPU", name: "Intel Iris Xe Graphics", discrete: false, spec: ["核显"] }],
+  });
+  assert.equal(accel, "gpu0");
+  assert.deepEqual(info.devices.map((d) => d.key), ["cpu", "gpu0"]);
+  for (const m of info.modules) assert.ok(info.devices.some((d) => d.key === m.device));
+  assert.ok(info.modules.find((m) => m.stage === "LLM").device === "gpu0");
+  assert.ok(buildSystemInfoHTML(info).includes("Iris Xe"));
+});
+
+test("deriveSystemInfo: discrete GPU wins and the iGPU is idle", () => {
+  const { info, accel } = deriveSystemInfo({
+    cpu: { name: "i7", spec: [] },
+    gpus: [
+      { tag: "GPU.0", name: "Intel AlderLake-S GT1", discrete: false, spec: [] },
+      { tag: "GPU.1", name: "Intel Arc A770", discrete: true, spec: [] },
+    ],
+  });
+  assert.equal(accel, "gpu1");
+  assert.equal(info.devices.find((d) => d.key === "gpu0").note, "空闲");
+  assert.equal(info.devices.find((d) => d.key === "gpu1").badge, "Arc A770");
+});
+
+test("deriveSystemInfo: no GPU falls back to CPU", () => {
+  const { info, accel } = deriveSystemInfo({ cpu: { name: "x", spec: [] }, gpus: [] });
+  assert.equal(accel, "cpu");
+  assert.ok(info.modules.every((m) => m.device === "cpu"));
 });

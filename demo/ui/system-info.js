@@ -112,6 +112,71 @@ export const SYSTEM_INFO = {
   ],
 };
 
+/** Rail data currently shown (static template until the host reports itself). */
+let currentInfo = SYSTEM_INFO;
+
+/**
+ * Key of the device that runs the accelerated stages: the discrete GPU, else the
+ * iGPU, else the CPU. Modules written against the NUC layout use "gpu1" for it.
+ */
+let accelKey = "gpu1";
+
+/** @param {string} [key] */
+function resolveKey(key) {
+  return key === "gpu1" ? accelKey : key;
+}
+
+/** Badge text of the accelerator, for stage details ("flow/HiFT · Arc A770"). */
+export function getAccelBadge() {
+  const d = currentInfo.devices.find((x) => x.key === accelKey);
+  return d ? d.badge : "GPU";
+}
+
+/**
+ * Turn the host report of sysstats_service.py (/sys-stats/info) into rail data.
+ * Pure; the static SYSTEM_INFO supplies the pipeline modules and notes.
+ * @param {any} host
+ * @param {SystemInfoData} [base]
+ * @returns {{info: SystemInfoData, accel: string}}
+ */
+export function deriveSystemInfo(host, base = SYSTEM_INFO) {
+  /** @type {DeviceInfo[]} */
+  const devices = [
+    {
+      key: "cpu",
+      tag: "CPU",
+      badge: "CPU",
+      name: host.cpu?.name || "CPU",
+      spec: host.cpu?.spec || [],
+      note: "VAD · 断句 · TTS",
+    },
+  ];
+  for (const g of host.gpus || []) {
+    const key = g.discrete ? "gpu1" : "gpu0";
+    if (devices.some((d) => d.key === key)) continue;
+    devices.push({
+      key,
+      tag: g.tag,
+      badge: g.discrete ? String(g.name).replace(/^Intel\s+/, "") : "iGPU",
+      name: g.name,
+      spec: g.spec || [],
+      note: "",
+    });
+  }
+  const accel = devices.some((d) => d.key === "gpu1") ? "gpu1" : devices.some((d) => d.key === "gpu0") ? "gpu0" : "cpu";
+  const accelDev = /** @type {DeviceInfo} */ (devices.find((d) => d.key === accel));
+  for (const d of devices) {
+    if (d.key === accel && accel !== "cpu") d.note = "STT · LLM";
+    else if (d.key !== "cpu") d.note = "空闲";
+  }
+  const modules = base.modules.map((m) => ({ ...m, device: m.device === "gpu1" ? accel : m.device }));
+  const notes = base.notes.slice();
+  notes[0] = accel === "cpu"
+    ? "推理链路：麦克风 → VAD → STT → LLM → TTS → 扬声器。本机没有可用的 GPU，所有环节运行于 CPU。"
+    : `推理链路：麦克风 → VAD → STT → LLM → TTS → 扬声器。STT 与 LLM 在 ${accelDev.name} (${accelDev.tag}) 上加速，其余环节运行于 CPU。`;
+  return { info: { host: host.host || base.host, devices, modules, notes }, accel };
+}
+
 /**
  * Build the rail's inner HTML. Pure (no DOM access) so it can be unit tested.
  * @param {SystemInfoData} [info]
@@ -208,13 +273,34 @@ export function setStageModule(stage, info) {
     if (el) el.textContent = [info.job, info.detail].filter(Boolean).join(" · ");
   }
   if (info.device) {
-    const device = SYSTEM_INFO.devices.find((d) => d.key === info.device);
-    row.dataset.device = info.device;
+    const key = resolveKey(info.device);
+    const device = currentInfo.devices.find((d) => d.key === key);
+    row.dataset.device = key;
     const badge = row.querySelector(".sysinfo-badge");
     if (badge && device) {
-      badge.dataset.device = info.device;
+      badge.dataset.device = key;
       badge.textContent = device.badge;
     }
+  }
+}
+
+/** Resolves once the live host report has been applied (or failed → template stays). */
+let hostLoaded = Promise.resolve();
+export function whenHostInfoLoaded() {
+  return hostLoaded;
+}
+
+/** @param {HTMLElement} body */
+async function loadHostInfo(body) {
+  try {
+    const res = await fetch("sys-stats/info", { cache: "no-store" });
+    if (!res.ok) return;
+    const { info, accel } = deriveSystemInfo(await res.json());
+    currentInfo = info;
+    accelKey = accel;
+    body.innerHTML = buildSystemInfoHTML(info);
+  } catch {
+    /* direct :7860 or backend without the stats service: keep the template */
   }
 }
 
@@ -229,6 +315,7 @@ export function initSystemInfo() {
   const backdrop = document.querySelector("#system-info-backdrop");
 
   body.innerHTML = buildSystemInfoHTML(SYSTEM_INFO);
+  hostLoaded = loadHostInfo(body);
 
   const desktop = window.matchMedia(DESKTOP_QUERY);
   const readCollapsed = () => {
