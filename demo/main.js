@@ -21,7 +21,7 @@ import { S2sRealtimeClient, normalizePlaybackBufferMs } from "./s2s-realtime-cli
 import { $, truncateError, errorMessage, DEBUG } from "./ui/dom.js";
 import { ChatView } from "./ui/chat.js?v=bubble-hold-v1";
 import { Account } from "./ui/account.js";
-import { initSystemInfo, setStageModule, setTtsModule, getAccelBadge, whenHostInfoLoaded } from "./ui/system-info.js?v=sysinfo-v10";
+import { initSystemInfo, setStageModule, setTtsModule, getAccelBadge, whenHostInfoLoaded } from "./ui/system-info.js?v=sysinfo-v11";
 import { initSysMonitor } from "./ui/sys-monitor.js?v=sysmon-v2";
 import { initStylePicker } from "./ui/style-picker.js?v=style-v3";
 import { createTtsEnginePicker } from "./tts-engine.js?v=engine-v2";
