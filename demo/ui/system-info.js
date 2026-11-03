@@ -256,6 +256,22 @@ export function setTtsModule(info) {
 }
 
 /**
+ * Rewrite the first rail note from where the stages actually run, so it can never
+ * disagree with the badges (STT may be on the CPU while TTS flow/HiFT is on the GPU).
+ */
+export function refreshPipelineNote() {
+  const note = document.querySelector(".sysinfo-notes li");
+  if (!note) return;
+  const rows = [...document.querySelectorAll(".sysinfo-module")];
+  const onAccel = rows.filter((r) => r.dataset.device === accelKey && accelKey !== "cpu").map((r) => r.dataset.stage);
+  const dev = currentInfo.devices.find((d) => d.key === accelKey);
+  const head = "推理链路：麦克风 → VAD → STT → LLM → TTS → 扬声器。";
+  note.textContent = !dev || accelKey === "cpu" || !onAccel.length
+    ? `${head}所有环节运行于 CPU。`
+    : `${head}${onAccel.join("、")} 在 ${dev.name} (${dev.tag}) 上加速，其余环节运行于 CPU。`;
+}
+
+/**
  * Same as setTtsModule for any pipeline stage ("STT", "LLM", "TTS"…).
  *
  * @param {string} stage
@@ -281,6 +297,7 @@ export function setStageModule(stage, info) {
       badge.dataset.device = key;
       badge.textContent = device.badge;
     }
+    refreshPipelineNote();
   }
 }
 
@@ -299,6 +316,7 @@ async function loadHostInfo(body) {
     currentInfo = info;
     accelKey = accel;
     body.innerHTML = buildSystemInfoHTML(info);
+    refreshPipelineNote();
   } catch {
     /* direct :7860 or backend without the stats service: keep the template */
   }
